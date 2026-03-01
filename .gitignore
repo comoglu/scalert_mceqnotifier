@@ -1,0 +1,11 @@
+# Real config with credentials — never commit this
+scalert_mceqnotifier.cfg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp files
+*.tmp
+*.xml.bak

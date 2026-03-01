@@ -1,0 +1,81 @@
+# scalert MC Earthquake Notifier — Configuration
+# Copy this file to scalert_mceqnotifier.cfg and edit with your settings.
+# Place it next to scalert_mceqnotifier.py
+
+[smtp]
+# SMTP server settings (Gmail example shown)
+server = smtp.gmail.com
+port   = 587
+ssl    = false
+tls    = true
+
+# SMTP credentials (for Gmail, use an App Password — not your regular password)
+# See: https://support.google.com/accounts/answer/185833
+user = your-email@gmail.com
+pw   = your-app-password
+
+# Sender address (usually same as user)
+from = your-email@gmail.com
+
+# Recipient list — comma-separated
+to = recipient1@example.com,recipient2@example.com
+
+[filter]
+# Minimum magnitude to send a notification (events below this are silently ignored)
+min_magnitude = 4.0
+
+# Set to true to only notify on NEW events (skip updates)
+new_events_only = true
+
+[seiscomp]
+# Direct database connection for scxmldump (recommended — avoids messaging dependency)
+# Adjust user, password, host, and database name to match your SeisComP setup
+database = mysql://sysop:sysop@localhost/seiscomp
+
+[map]
+width      = 512
+height     = 512
+radius_min = 5
+radius_max = 40
+auto_radius = true
+
+[content]
+# scbulletin bulletin format: autoloc1 | autoloc3 | autoloc3extra | fdsnws
+bulletin_format   = autoloc3
+bulletin_enhanced = true
+
+# KML event-location file attachment
+attach_kml = true
+
+# Include Google Maps link in plain-text body
+include_maps_link = true
+
+# Footer text at the bottom of every email
+footer = Automated Earthquake Notification
+
+# Travel-time curve PNG attachment (ObsPy TauPy IASP91)
+generate_travel_curves = true
+
+# Waveform plot PNG attachment — requires FDSNWS dataselect running locally
+generate_waveforms = false
+fdsnws_url         = http://localhost:8081
+waveform_pre_secs  = 30
+waveform_post_secs = 300
+waveform_max_stations = 8
+
+# Maximum rows in the phase arrivals table
+max_arrivals_table = 30
+
+[cities]
+# Path to cities.xml — leave empty to auto-detect from $SEISCOMP_ROOT/share/cities.xml
+xml =
+
+# Show cities within this radius (km). Falls back to nearest max_count if too
+# few cities are found within the radius (e.g. ocean events).
+radius_km = 1000
+
+# Maximum number of cities to show in the distance table
+max_count = 10
+
+# Ignore non-capital cities with population below this threshold
+min_population = 300000
