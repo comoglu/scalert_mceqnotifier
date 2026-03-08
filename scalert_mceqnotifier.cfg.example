@@ -20,6 +20,9 @@ from = your-email@gmail.com
 # Recipient list — comma-separated
 to = recipient1@example.com,recipient2@example.com
 
+# Connection timeout in seconds (prevents hanging when firewall/VPN blocks SMTP)
+timeout = 30
+
 [filter]
 # Minimum magnitude to send a notification (events below this are silently ignored)
 min_magnitude = 4.0

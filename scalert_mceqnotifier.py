@@ -56,6 +56,7 @@ _DEFAULTS = {
         "pw":       "",
         "from":     "",
         "to":       "",          # comma-separated recipient list
+        "timeout":  "30",        # SMTP connection timeout in seconds
     },
     "filter": {
         "min_magnitude":   "4.0",   # ignore events below this magnitude
@@ -103,6 +104,56 @@ _DEFAULTS = {
 _taup_model   = None
 _cities_cache = None   # populated on first call to _load_cities_xml()
 
+# Static CSS for HTML emails (header gradient is injected dynamically)
+_EMAIL_CSS = (
+    "body{margin:0;padding:0;background:#ececec;"
+    "font-family:Arial,Helvetica,sans-serif;}"
+    ".wrap{max-width:820px;margin:0 auto;background:#fff;}"
+    ".hdr h1{margin:0 0 6px;font-size:12px;letter-spacing:3px;"
+    "text-transform:uppercase;opacity:.85;}"
+    ".hdr h2{margin:0 0 4px;font-size:34px;font-weight:bold;}"
+    ".hdr p{margin:0;font-size:14px;opacity:.9;}"
+    ".tsunami{background:#c0392b;color:#fff;padding:14px 20px;"
+    "text-align:center;font-size:15px;font-weight:bold;}"
+    ".body{padding:20px 26px;}"
+    "h3{font-size:14px;color:#2c3e50;border-bottom:2px solid #eee;"
+    "padding-bottom:5px;margin:22px 0 10px;}"
+    "table{width:100%;border-collapse:collapse;margin:0 0 18px;font-size:13px;}"
+    "th{padding:8px 11px;text-align:left;color:#fff;}"
+    "td{padding:6px 11px;border-bottom:1px solid #eee;}"
+    "tr:last-child td{border-bottom:none;}"
+    "tr:nth-child(even) td{background:#fafafa;}"
+    ".ev th{background:#2c3e50;}"
+    ".ci th{background:#1e6f3e;}"
+    ".ph th{background:#154360;}"
+    ".lbl{color:#888;font-weight:600;width:170px;white-space:nowrap;}"
+    ".badge{display:inline-block;padding:1px 8px;border-radius:3px;"
+    "font-size:11px;font-weight:bold;color:#fff;}"
+    ".mapbox{text-align:center;margin:14px 0;}"
+    ".mapbox img{max-width:100%;border:1px solid #ddd;border-radius:4px;}"
+    ".gbtn{display:inline-block;margin:8px 0;padding:8px 18px;"
+    "background:#4285F4;color:#fff;text-decoration:none;"
+    "border-radius:4px;font-size:13px;font-weight:bold;}"
+    ".bul{background:#1a1a2e;color:#00e676;font-family:monospace;"
+    "font-size:11.5px;padding:16px;border-radius:4px;"
+    "white-space:pre;overflow-x:auto;margin:0 0 18px;}"
+    ".cap{font-weight:bold;}"
+    ".res-ok{color:#27ae60;}"
+    ".res-med{color:#d35400;}"
+    ".res-bad{color:#c0392b;font-weight:bold;}"
+    ".p-ph{color:#c0392b;font-weight:bold;}"
+    ".s-ph{color:#1a5276;font-weight:bold;}"
+    ".foot{text-align:center;color:#aaa;font-size:11px;"
+    "padding:14px;border-top:1px solid #eee;}"
+)
+
+# Tiered tsunami risk messages (USGS/PTWC criteria)
+_TSUNAMI_MESSAGES = {
+    "POSSIBLE": "Shallow earthquake — tsunami possible but unlikely to be destructive.",
+    "LIKELY":   "Large shallow earthquake — destructive local tsunami likely.",
+    "EXPECTED": "Major shallow earthquake — destructive regional tsunami expected.",
+}
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (identical to filter_mceqnotifier.py)
@@ -136,13 +187,38 @@ def _fmt_time(iso):
 
 
 def _depth_info(depth_km):
+    """Classify earthquake depth."""
     if depth_km is None:
-        return "Unknown", False
+        return "Unknown"
     if depth_km < 70:
-        return "Shallow", True
-    elif depth_km < 300:
-        return "Intermediate", False
-    return "Deep", False
+        return "Shallow"
+    if depth_km < 300:
+        return "Intermediate"
+    return "Deep"
+
+
+def _tsunami_risk(mag_val, depth_km):
+    """Estimate tsunami risk based on USGS/PTWC initial-assessment criteria.
+
+    Returns: None | "POSSIBLE" | "LIKELY" | "EXPECTED"
+
+    Thresholds (shallow marine events only, depth < 100 km):
+      M < 6.5  → None   (very unlikely to trigger tsunami)
+      M 6.5–7.5 → POSSIBLE (rarely destructive, local effects)
+      M 7.6–7.8 → LIKELY   (destructive local tsunami)
+      M ≥ 7.9   → EXPECTED (destructive regional tsunami)
+    """
+    if mag_val is None or depth_km is None:
+        return None
+    if depth_km >= 100:
+        return None
+    if mag_val >= 7.9:
+        return "EXPECTED"
+    if mag_val >= 7.6:
+        return "LIKELY"
+    if mag_val >= 6.5:
+        return "POSSIBLE"
+    return None
 
 
 def _load_cities_xml(cfg) -> list:
@@ -220,8 +296,55 @@ def _get_taup_model():
     return _taup_model
 
 
+def _urgency(mag_val):
+    """Return (emoji, label, color1, color2) aligned with tsunami.gov alert colors."""
+    if mag_val is not None and mag_val >= 6.0:
+        return ("🔴", "WARNING",  "#c0392b", "#e74c3c")
+    if mag_val is not None and mag_val >= 5.0:
+        return ("🟠", "ADVISORY", "#d35400", "#e67e22")
+    if mag_val is not None and mag_val >= 4.0:
+        return ("🟡", "WATCH",    "#b7950b", "#d4ac0d")
+    return ("🟢", "INFO",         "#1e8449", "#27ae60")
+
+
 def _log(msg):
     print(f"[scalert_mceqnotifier] {msg}", file=sys.stderr)
+
+
+def _run_sc_tool(cmd, input_data=None, output_suffix=None, timeout=30):
+    """Run a SeisComP CLI tool, optionally writing output to a temp file.
+
+    Returns (file_bytes, None) on success when output_suffix is given,
+    or (None, stderr_str) on failure.  Without output_suffix, returns
+    (True, None) / (False, stderr_str).
+    """
+    out_path = (tempfile.mktemp(suffix=output_suffix, prefix="scalert_mceq_")
+                if output_suffix else None)
+    try:
+        if out_path:
+            cmd = [c.replace("{OUT}", out_path) for c in cmd]
+        _log(f"running: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd, input=input_data, capture_output=True, timeout=timeout)
+        if result.returncode != 0:
+            err = result.stderr.decode(errors="replace")
+            _log(f"{cmd[0]} error: {err}")
+            return (None if out_path else False, err)
+        if out_path:
+            if not os.path.isfile(out_path):
+                return (None, f"{cmd[0]} produced no output file")
+            with open(out_path, "rb") as f:
+                return (f.read(), None)
+        return (True, None)
+    except subprocess.TimeoutExpired:
+        _log(f"{cmd[0]} timed out")
+        return (None if out_path else False, "timeout")
+    except Exception as e:
+        _log(f"{cmd[0]} failed: {e}")
+        return (None if out_path else False, str(e))
+    finally:
+        if out_path and os.path.isfile(out_path):
+            os.remove(out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -298,21 +421,23 @@ class ScalertNotifier:
 
         # ── Build content ────────────────────────────────────────────────
         subject  = self._build_subject(ed)
-        map_att  = self._gen_map(ed)           # (name, bytes, mime, cid) or None
-        plain    = self._build_plain(ep, ed)
-        html     = self._build_html(ep, ed, map_att)
-        ttc_att  = None
-        wfm_att  = None
-        kml_att  = None
+        bd       = self._prepare_body_data(ed)
+        bulletin = self._get_bulletin_text(ep)
+        map_att  = self._gen_map(ed)
+        plain    = self._build_plain(ed, bd, bulletin)
+        html     = self._build_html(ed, bd, bulletin, map_att)
 
-        if self._cfg.getboolean("content", "generate_travel_curves"):
-            ttc_att = self._gen_travel_curves(ed)
-        if self._cfg.getboolean("content", "generate_waveforms"):
-            wfm_att = self._gen_waveforms(ed)
-        if self._cfg.getboolean("content", "attach_kml"):
-            kml_att = self._gen_kml(ep)
-
-        attachments = [a for a in [map_att, ttc_att, wfm_att, kml_att] if a]
+        generators = [
+            ("generate_travel_curves", self._gen_travel_curves, (ed,)),
+            ("generate_waveforms",     self._gen_waveforms,     (ed,)),
+            ("attach_kml",             self._gen_kml,           (ep,)),
+        ]
+        attachments = [map_att] if map_att else []
+        for key, fn, args in generators:
+            if self._cfg.getboolean("content", key):
+                att = fn(*args)
+                if att:
+                    attachments.append(att)
 
         # ── Send ─────────────────────────────────────────────────────────
         try:
@@ -329,22 +454,21 @@ class ScalertNotifier:
     # -----------------------------------------------------------------------
     def _fetch_event(self, event_id):
         """Dump event XML via scxmldump and parse into EventParameters."""
-        tmp = tempfile.mktemp(suffix=".xml", prefix="scalert_mceq_")
+        db  = self._cfg.get("seiscomp", "database").strip()
+        cmd = ["scxmldump", "-E", event_id, "-p", "-P", "-M", "-A", "-o", "{OUT}"]
+        if db:
+            cmd += ["-d", db]
+
+        xml_bytes, err = _run_sc_tool(cmd, output_suffix=".xml")
+        if xml_bytes is None:
+            return None
+
         try:
-            db  = self._cfg.get("seiscomp", "database").strip()
-            cmd = ["scxmldump", "-E", event_id, "-p", "-P", "-M", "-A", "-o", tmp]
-            if db:
-                cmd += ["-d", db]
+            tmp = tempfile.mktemp(suffix=".xml", prefix="scalert_mceq_parse_")
+            with open(tmp, "wb") as f:
+                f.write(xml_bytes)
 
-            _log(f"running: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-            if result.returncode != 0:
-                _log("scxmldump error: " + result.stderr.decode(errors="replace"))
-                return None
-
-            # Enable public-object lookup before reading XML
             datamodel.PublicObject.SetRegistrationEnabled(True)
-
             ar = io.XMLArchive()
             if not ar.open(tmp):
                 _log("cannot open XML archive")
@@ -363,10 +487,6 @@ class ScalertNotifier:
 
             _log(f"fetched {event_id}: {ep.eventCount()} event(s)")
             return ep
-
-        except subprocess.TimeoutExpired:
-            _log("scxmldump timed out")
-            return None
         except Exception as e:
             _log(f"fetch error: {e}")
             _log(traceback.format_exc())
@@ -468,17 +588,11 @@ class ScalertNotifier:
         mag_val = ed["mag_val"]
         depth   = ed["depth"]
 
-        if mag_val is not None and mag_val >= 6.0:
-            urgency = "🔴 URGENT"
-        elif mag_val is not None and mag_val >= 5.0:
-            urgency = "🟠"
-        elif mag_val is not None and mag_val >= 4.0:
-            urgency = "🟡"
-        else:
-            urgency = "🟢"
+        emoji, label, _, _ = _urgency(mag_val)
+        urgency = f"{emoji} {label}".strip()
 
-        _, tsunami_risk = _depth_info(depth)
-        tsunami_flag = " ⚠️TSUNAMI?" if (tsunami_risk and mag_val and mag_val >= 7.0) else ""
+        risk = _tsunami_risk(mag_val, depth)
+        tsunami_flag = f" ⚠️TSUNAMI {risk}" if risk else ""
 
         mag_str   = f"M{mag_val:.1f} {ed['mag_type']}".strip() if mag_val is not None else "M?"
         depth_str = f"[{depth:.0f}km]" if depth is not None else ""
@@ -500,18 +614,44 @@ class ScalertNotifier:
         return subject
 
     # -----------------------------------------------------------------------
+    # Shared data prep
+    # -----------------------------------------------------------------------
+    def _get_bulletin_text(self, ep):
+        """Return bulletin string (or error message)."""
+        try:
+            from seiscomp.scbulletin import Bulletin as SCBulletin
+            scb = SCBulletin(None)
+            scb.enhanced = self._cfg.getboolean("content", "bulletin_enhanced")
+            scb.format   = self._cfg.get("content", "bulletin_format")
+            if ep.eventCount() > 0:
+                return scb.printEvent(ep.event(0)) or "(empty bulletin)"
+            return "(no event)"
+        except Exception as e:
+            _log(f"scbulletin failed: {e}")
+            return f"(scbulletin error: {e})"
+
+    def _prepare_body_data(self, ed):
+        """Pre-compute values shared by plain-text and HTML body builders."""
+        mag_val = ed["mag_val"]
+        depth   = ed["depth"]
+        lat, lon = ed["lat"], ed["lon"]
+        depth_class = _depth_info(depth)
+        return {
+            "mag_str":       f"M{mag_val:.1f} {ed['mag_type']}".strip() if mag_val is not None else "M?",
+            "depth_str":     f"{depth:.1f} km" if depth is not None else "N/A",
+            "depth_class":   depth_class,
+            "tsunami_risk":  _tsunami_risk(mag_val, depth),
+            "maps_url":      f"https://maps.google.com/maps?q={lat},{lon}&z=8",
+            "short_id":      ed["id"].split("/")[-1] if "/" in ed["id"] else ed["id"],
+            "city_rows":     _city_distances(lat, lon, self._cfg),
+            "arrivals":      ed["arrivals"][:self._cfg.getint("content", "max_arrivals_table")],
+            "footer":        self._cfg.get("content", "footer"),
+        }
+
+    # -----------------------------------------------------------------------
     # Plain text
     # -----------------------------------------------------------------------
-    def _build_plain(self, ep, ed) -> str:
-        lat        = ed["lat"]
-        lon        = ed["lon"]
-        mag_val    = ed["mag_val"]
-        depth      = ed["depth"]
-        depth_str  = f"{depth:.1f} km" if depth is not None else "N/A"
-        mag_str    = f"M{mag_val:.1f} {ed['mag_type']}".strip() if mag_val is not None else "M?"
-        maps_link  = f"https://maps.google.com/maps?q={lat},{lon}&z=8"
-        depth_class, tsunami_risk = _depth_info(depth)
-
+    def _build_plain(self, ed, bd, bulletin) -> str:
         lines = [
             "EARTHQUAKE NOTIFICATION",
             "=" * 56,
@@ -519,33 +659,31 @@ class ScalertNotifier:
             f"EVENT ID  : {ed['id']}",
             f"TIME (UTC): {_fmt_time(ed['time'])}",
             f"REGION    : {ed['region'] or 'N/A'}",
-            f"LATITUDE  : {lat:.4f}°",
-            f"LONGITUDE : {lon:.4f}°",
-            f"DEPTH     : {depth_str} ({depth_class})",
-            f"MAGNITUDE : {mag_str}",
+            f"LATITUDE  : {ed['lat']:.4f}°",
+            f"LONGITUDE : {ed['lon']:.4f}°",
+            f"DEPTH     : {bd['depth_str']} ({bd['depth_class']})",
+            f"MAGNITUDE : {bd['mag_str']}",
             f"PHASES    : {ed['phases']}",
             "",
         ]
 
-        if tsunami_risk and mag_val and mag_val >= 7.0:
+        if bd["tsunami_risk"]:
             lines += [
-                "⚠️  TSUNAMI ADVISORY: Large shallow earthquake detected.",
-                "   Monitor official warnings (PTWC and regional agencies).",
+                f"⚠️  TSUNAMI {bd['tsunami_risk']}: {_TSUNAMI_MESSAGES[bd['tsunami_risk']]}",
+                "   Monitor official warnings (PTWC, NTWC, and regional agencies).",
                 "",
             ]
 
         if self._cfg.getboolean("content", "include_maps_link"):
-            lines += [f"GOOGLE MAPS: {maps_link}", ""]
+            lines += [f"GOOGLE MAPS: {bd['maps_url']}", ""]
 
-        city_rows = _city_distances(lat, lon, self._cfg)
         lines += ["DISTANCES TO KEY LOCATIONS", "-" * 40]
-        for name, dist_km, bearing, is_cap in city_rows:
+        for name, dist_km, bearing, is_cap in bd["city_rows"]:
             cap_mark = "★" if is_cap else " "
             lines.append(f"  {cap_mark} {name:<18} {dist_km:>7.0f} km  {bearing}")
         lines += ["", "★ = capital city", ""]
 
-        max_arr  = self._cfg.getint("content", "max_arrivals_table")
-        arrivals = ed["arrivals"][:max_arr]
+        arrivals = bd["arrivals"]
         if arrivals:
             lines += ["PHASE ARRIVALS", "-" * 60]
             lines.append(
@@ -561,145 +699,69 @@ class ScalertNotifier:
                 lines.append(
                     f"  {a['net']:<6} {a['sta']:<8} {a['phase']:<6} {d_deg:>6} {d_km:>8} "
                     f"{az:>6} {tt:>7} {res:>7}")
-            if ed["phases"] > max_arr:
-                lines.append(f"  ... and {ed['phases'] - max_arr} more arrivals")
+            if ed["phases"] > len(arrivals):
+                lines.append(f"  ... and {ed['phases'] - len(arrivals)} more arrivals")
             lines.append("")
 
-        lines += ["=" * 56, "OFFICIAL BULLETIN", "=" * 56, ""]
-        try:
-            from seiscomp.scbulletin import Bulletin as SCBulletin
-            scb = SCBulletin(None)
-            scb.enhanced = self._cfg.getboolean("content", "bulletin_enhanced")
-            scb.format   = self._cfg.get("content", "bulletin_format")
-            if ep.eventCount() > 0:
-                text = scb.printEvent(ep.event(0))
-                lines.append(text or "(empty bulletin)")
-        except Exception as e:
-            _log(f"scbulletin failed: {e}")
-            lines.append(f"(scbulletin error: {e})")
+        lines += ["=" * 56, "OFFICIAL BULLETIN", "=" * 56, "", bulletin]
 
-        footer = self._cfg.get("content", "footer")
-        if footer:
-            lines += ["", "=" * 56, footer]
+        if bd["footer"]:
+            lines += ["", "=" * 56, bd["footer"]]
 
         return "\n".join(lines)
 
     # -----------------------------------------------------------------------
     # HTML body
     # -----------------------------------------------------------------------
-    def _build_html(self, ep, ed, map_att) -> str:
-        mag_val  = ed["mag_val"]
-        depth    = ed["depth"]
+    def _build_html(self, ed, bd, bulletin, map_att) -> str:
         lat, lon = ed["lat"], ed["lon"]
         region   = _he(ed["region"] or "Unknown region")
-        depth_class, tsunami_risk = _depth_info(depth)
-        show_tsunami = tsunami_risk and mag_val is not None and mag_val >= 7.0
-
-        if mag_val is not None and mag_val >= 6.0:
-            hdr_c1, hdr_c2 = "#c0392b", "#e74c3c"
-        elif mag_val is not None and mag_val >= 5.0:
-            hdr_c1, hdr_c2 = "#d35400", "#e67e22"
-        elif mag_val is not None and mag_val >= 4.0:
-            hdr_c1, hdr_c2 = "#b7950b", "#d4ac0d"
-        else:
-            hdr_c1, hdr_c2 = "#1e8449", "#27ae60"
-
-        if mag_val is not None and mag_val >= 6.0:
-            urgency_emoji = "🔴"
-        elif mag_val is not None and mag_val >= 5.0:
-            urgency_emoji = "🟠"
-        elif mag_val is not None and mag_val >= 4.0:
-            urgency_emoji = "🟡"
-        else:
-            urgency_emoji = "🟢"
-
-        mag_str   = f"M{mag_val:.1f} {ed['mag_type']}".strip() if mag_val is not None else "M?"
-        depth_str = f"{depth:.1f} km" if depth is not None else "N/A"
-        maps_url  = f"https://maps.google.com/maps?q={lat},{lon}&z=8"
         time_disp = _he(_fmt_time(ed["time"]))
-        short_id  = ed["id"].split("/")[-1] if "/" in ed["id"] else ed["id"]
+
+        urgency_emoji, _, hdr_c1, hdr_c2 = _urgency(ed["mag_val"])
 
         depth_badge_bg = {
             "Shallow": "#e74c3c",
             "Intermediate": "#e67e22",
             "Deep": "#3498db",
-        }.get(depth_class, "#95a5a6")
+        }.get(bd["depth_class"], "#95a5a6")
 
-        css = (
-            "<style>"
-            "body{margin:0;padding:0;background:#ececec;"
-            "font-family:Arial,Helvetica,sans-serif;}"
-            ".wrap{max-width:820px;margin:0 auto;background:#fff;}"
-            f".hdr{{padding:28px 20px;text-align:center;"
-            f"background:linear-gradient(135deg,{hdr_c1},{hdr_c2});color:#fff;}}"
-            ".hdr h1{margin:0 0 6px;font-size:12px;letter-spacing:3px;"
-            "text-transform:uppercase;opacity:.85;}"
-            ".hdr h2{margin:0 0 4px;font-size:34px;font-weight:bold;}"
-            ".hdr p{margin:0;font-size:14px;opacity:.9;}"
-            ".tsunami{background:#c0392b;color:#fff;padding:14px 20px;"
-            "text-align:center;font-size:15px;font-weight:bold;}"
-            ".body{padding:20px 26px;}"
-            "h3{font-size:14px;color:#2c3e50;border-bottom:2px solid #eee;"
-            "padding-bottom:5px;margin:22px 0 10px;}"
-            "table{width:100%;border-collapse:collapse;margin:0 0 18px;font-size:13px;}"
-            "th{padding:8px 11px;text-align:left;color:#fff;}"
-            "td{padding:6px 11px;border-bottom:1px solid #eee;}"
-            "tr:last-child td{border-bottom:none;}"
-            "tr:nth-child(even) td{background:#fafafa;}"
-            ".ev th{background:#2c3e50;}"
-            ".ci th{background:#1e6f3e;}"
-            ".ph th{background:#154360;}"
-            ".lbl{color:#888;font-weight:600;width:170px;white-space:nowrap;}"
-            ".badge{display:inline-block;padding:1px 8px;border-radius:3px;"
-            "font-size:11px;font-weight:bold;color:#fff;}"
-            ".mapbox{text-align:center;margin:14px 0;}"
-            ".mapbox img{max-width:100%;border:1px solid #ddd;border-radius:4px;}"
-            ".gbtn{display:inline-block;margin:8px 0;padding:8px 18px;"
-            "background:#4285F4;color:#fff;text-decoration:none;"
-            "border-radius:4px;font-size:13px;font-weight:bold;}"
-            ".bul{background:#1a1a2e;color:#00e676;font-family:monospace;"
-            "font-size:11.5px;padding:16px;border-radius:4px;"
-            "white-space:pre;overflow-x:auto;margin:0 0 18px;}"
-            ".cap{font-weight:bold;}"
-            ".res-ok{color:#27ae60;}"
-            ".res-med{color:#d35400;}"
-            ".res-bad{color:#c0392b;font-weight:bold;}"
-            ".p-ph{color:#c0392b;font-weight:bold;}"
-            ".s-ph{color:#1a5276;font-weight:bold;}"
-            ".foot{text-align:center;color:#aaa;font-size:11px;"
-            "padding:14px;border-top:1px solid #eee;}"
-            "</style>")
+        hdr_rule = (f".hdr{{padding:28px 20px;text-align:center;"
+                    f"background:linear-gradient(135deg,{hdr_c1},{hdr_c2});color:#fff;}}")
+        css = f"<style>{_EMAIL_CSS}{hdr_rule}</style>"
 
         hdr = (
             '<div class="hdr">'
             "<h1>🌏 Earthquake Notification</h1>"
-            f"<h2>{urgency_emoji} {_he(mag_str)}</h2>"
+            f"<h2>{urgency_emoji} {_he(bd['mag_str'])}</h2>"
             f"<p>{time_disp}</p><p>{region}</p>"
             "</div>")
 
         tsunami_banner = (
             '<div class="tsunami">'
-            "⚠️ TSUNAMI ADVISORY — Large shallow earthquake detected. "
-            "Monitor official warnings from PTWC and regional agencies."
+            f"⚠️ TSUNAMI {bd['tsunami_risk']} — "
+            f"{_TSUNAMI_MESSAGES[bd['tsunami_risk']]} "
+            "Monitor official warnings from PTWC, NTWC, and regional agencies."
             "</div>"
-        ) if show_tsunami else ""
+        ) if bd["tsunami_risk"] else ""
 
         evt_tbl = (
             "<h3>Event Parameters</h3>"
             '<table class="ev">'
-            f'<tr><td class="lbl">Event ID</td><td>{_he(short_id)}</td></tr>'
+            f'<tr><td class="lbl">Event ID</td><td>{_he(bd["short_id"])}</td></tr>'
             f'<tr><td class="lbl">Origin Time (UTC)</td><td>{time_disp}</td></tr>'
             f'<tr><td class="lbl">Region</td><td>{region}</td></tr>'
             f'<tr><td class="lbl">Latitude</td><td>{lat:.4f}&deg;</td></tr>'
             f'<tr><td class="lbl">Longitude</td><td>{lon:.4f}&deg;</td></tr>'
-            f'<tr><td class="lbl">Depth</td><td>{_he(depth_str)}&nbsp;'
-            f'<span class="badge" style="background:{depth_badge_bg}">{depth_class}</span></td></tr>'
-            f'<tr><td class="lbl">Magnitude</td><td>{_he(mag_str)}</td></tr>'
+            f'<tr><td class="lbl">Depth</td><td>{_he(bd["depth_str"])}&nbsp;'
+            f'<span class="badge" style="background:{depth_badge_bg}">{bd["depth_class"]}</span></td></tr>'
+            f'<tr><td class="lbl">Magnitude</td><td>{_he(bd["mag_str"])}</td></tr>'
             f'<tr><td class="lbl">Phases Used</td><td>{ed["phases"]}</td></tr>'
             "</table>")
 
-        # Map section — use CID from map_att if available
+        # Map section
         map_cid = map_att[3] if map_att else None
+        maps_url = bd["maps_url"]
         if map_cid:
             map_sec = (
                 "<h3>Epicenter Map</h3>"
@@ -715,7 +777,7 @@ class ScalertNotifier:
                 "</div>")
 
         city_rows_html = ""
-        for name, dist_km, bearing, is_cap in _city_distances(lat, lon, self._cfg):
+        for name, dist_km, bearing, is_cap in bd["city_rows"]:
             cls  = ' class="cap"' if is_cap else ""
             star = " ★" if is_cap else ""
             city_rows_html += (
@@ -728,8 +790,7 @@ class ScalertNotifier:
             "<tr><th>Location</th><th>Distance</th><th>Direction</th></tr>"
             f"{city_rows_html}</table>")
 
-        max_arr  = self._cfg.getint("content", "max_arrivals_table")
-        arrivals = ed["arrivals"][:max_arr]
+        arrivals = bd["arrivals"]
         arr_rows_html = ""
         for a in arrivals:
             d_deg = f"{a['dist_deg']:.2f}&deg;" if a["dist_deg"]    is not None else "—"
@@ -762,23 +823,11 @@ class ScalertNotifier:
             f"{arr_rows_html}</table>"
         ) if arr_rows_html else ""
 
-        bul_text = ""
-        try:
-            from seiscomp.scbulletin import Bulletin as SCBulletin
-            scb = SCBulletin(None)
-            scb.enhanced = self._cfg.getboolean("content", "bulletin_enhanced")
-            scb.format   = self._cfg.get("content", "bulletin_format")
-            if ep.eventCount() > 0:
-                bul_text = _he(scb.printEvent(ep.event(0)) or "(empty bulletin)")
-        except Exception as e:
-            _log(f"scbulletin failed: {e}")
-            bul_text = _he(f"(scbulletin error: {e})")
-
         bul_sec = (
             "<h3>Official Bulletin</h3>"
-            f'<div class="bul">{bul_text}</div>')
+            f'<div class="bul">{_he(bulletin)}</div>')
 
-        footer_text = _he(self._cfg.get("content", "footer"))
+        footer_text = _he(bd["footer"])
 
         return (
             "<!DOCTYPE html><html>"
@@ -817,38 +866,22 @@ class ScalertNotifier:
         width   = self._cfg.get("map", "width")
         height  = self._cfg.get("map", "height")
 
-        img_path = tempfile.mktemp(suffix=".jpg", prefix="scalert_mceq_map_")
-        try:
-            cmd = [
-                "scmapcut", "-o", img_path, "-d", f"{width}x{height}",
-                "--lat", str(lat), "--lon", str(lon), "--depth", str(depth),
-                "-m", f"{radius / 2:.2f}",
-            ]
-            if mag_val is not None:
-                cmd += ["--mag", f"{mag_val:.1f}"]
+        cmd = [
+            "scmapcut", "-o", "{OUT}", "-d", f"{width}x{height}",
+            "--lat", str(lat), "--lon", str(lon), "--depth", str(depth),
+            "-m", f"{radius / 2:.2f}",
+        ]
+        if mag_val is not None:
+            cmd += ["--mag", f"{mag_val:.1f}"]
 
-            result = subprocess.run(cmd, capture_output=True, timeout=20)
-            if result.returncode != 0 or not os.path.isfile(img_path):
-                _log("scmapcut failed: " + result.stderr.decode(errors="replace"))
-                return None
-
-            with open(img_path, "rb") as f:
-                data = f.read()
-
-            import random, time, urllib.parse
-            cid = f"{random.randint(0, 99999)}.{os.getpid()}.{time.time()}@gds.local"
-            _log(f"map generated ({len(data)} B)")
-            return ("epicenter.jpg", data, "image/jpeg", cid)
-
-        except subprocess.TimeoutExpired:
-            _log("scmapcut timed out")
+        data, err = _run_sc_tool(cmd, output_suffix=".jpg", timeout=20)
+        if data is None:
             return None
-        except Exception as e:
-            _log(f"map failed: {e}")
-            return None
-        finally:
-            if os.path.isfile(img_path):
-                os.remove(img_path)
+
+        import random, time
+        cid = f"{random.randint(0, 99999)}.{os.getpid()}.{time.time()}@gds.local"
+        _log(f"map generated ({len(data)} B)")
+        return ("epicenter.jpg", data, "image/jpeg", cid)
 
     # -----------------------------------------------------------------------
     # Travel-time curves — returns (name, bytes, mime_type, None) or None
@@ -1031,39 +1064,28 @@ class ScalertNotifier:
     # KML generation — returns (name, bytes, mime_type, None) or None
     # -----------------------------------------------------------------------
     def _gen_kml(self, ep):
-        kml_path = tempfile.mktemp(suffix=".kml", prefix="scalert_mceq_kml_")
+        # Serialise EP back to SCML
+        scml_tmp = tempfile.mktemp(suffix=".xml", prefix="scalert_mceq_scml_")
         try:
-            # Serialise EP back to SCML, pipe into scbulletin --kml
-            scml_tmp = tempfile.mktemp(suffix=".xml", prefix="scalert_mceq_scml_")
             ar = io.XMLArchive()
             ar.create(scml_tmp)
             ar.writeObject(ep)
             ar.close()
-
             with open(scml_tmp, "rb") as f:
                 scml_bytes = f.read()
-            os.remove(scml_tmp)
-
-            result = subprocess.run(
-                ["scbulletin", "--kml", "-i", "-", "-o", kml_path],
-                input=scml_bytes, capture_output=True, timeout=15)
-
-            if result.returncode != 0 or not os.path.isfile(kml_path):
-                _log("scbulletin --kml failed: " + result.stderr.decode(errors="replace"))
-                return None
-
-            with open(kml_path, "rb") as f:
-                data = f.read()
-            _log(f"KML generated ({len(data)} B)")
-            return ("event_location.kml", data,
-                    "application/vnd.google-earth.kml+xml", None)
-
-        except Exception as e:
-            _log(f"KML failed: {e}")
-            return None
         finally:
-            if os.path.isfile(kml_path):
-                os.remove(kml_path)
+            if os.path.isfile(scml_tmp):
+                os.remove(scml_tmp)
+
+        cmd = ["scbulletin", "--kml", "-i", "-", "-o", "{OUT}"]
+        data, err = _run_sc_tool(cmd, input_data=scml_bytes,
+                                 output_suffix=".kml", timeout=15)
+        if data is None:
+            return None
+
+        _log(f"KML generated ({len(data)} B)")
+        return ("event_location.kml", data,
+                "application/vnd.google-earth.kml+xml", None)
 
     # -----------------------------------------------------------------------
     # SMTP sending
@@ -1087,79 +1109,75 @@ class ScalertNotifier:
 
         msg = self._build_mime(subject, sender, recipients, plain, html, attachments)
 
-        _log(f"connecting to {srv}:{port}")
-        if use_ssl:
-            server = smtplib.SMTP_SSL(srv, port)
+        smtp_timeout = s.getint("smtp", "timeout", fallback=30)
+        _log(f"connecting to {srv}:{port} (timeout={smtp_timeout}s)")
+        try:
+            if use_ssl:
+                server = smtplib.SMTP_SSL(srv, port, timeout=smtp_timeout)
+            else:
+                server = smtplib.SMTP(srv, port, timeout=smtp_timeout)
+                if use_tls:
+                    server.starttls()
+
+            if user:
+                server.login(user, pw)
+
+            server.sendmail(sender, recipients, msg.as_bytes())
+            server.quit()
+            _log(f"email sent to {recipients}")
+        except (smtplib.SMTPException, OSError) as exc:
+            _log(f"SMTP error: {exc}")
+
+    @staticmethod
+    def _make_part(name, data, mime_type, cid=None, disposition="attachment"):
+        """Create a MIME part from raw bytes."""
+        main_t, sub_t = mime_type.split("/", 1)
+        if main_t == "image":
+            part = MIMEImage(data, _subtype=sub_t, name=name)
         else:
-            server = smtplib.SMTP(srv, port)
-            if use_tls:
-                server.starttls()
-
-        if user:
-            server.login(user, pw)
-
-        server.sendmail(sender, recipients, msg.as_bytes())
-        server.quit()
-        _log(f"email sent to {recipients}")
+            part = MIMEBase(main_t, sub_t)
+            part.set_payload(data)
+            encoders.encode_base64(part)
+        if cid:
+            part.add_header("Content-ID", f"<{cid}>")
+        part.add_header("Content-Disposition",
+                        disposition if disposition == "inline"
+                        else f'attachment; filename="{name}"')
+        return part
 
     @staticmethod
     def _build_mime(subject, sender, recipients, plain, html, attachments):
-        """
-        Assemble MIME message.
-        attachments = list of (name, bytes, mime_type, cid_or_None)
-        Attachments with a cid that appears as 'cid:<cid>' in html are embedded inline.
-        """
-        plain_part = MIMEText(plain, "plain", "utf-8")
-        html_part  = MIMEText(html,  "html",  "utf-8")
+        """Assemble MIME message with inline and regular attachments."""
+        is_inline = lambda c: c and f"cid:{c}" in html
+        inlines  = [a for a in attachments if is_inline(a[3])]
+        regulars = [a for a in attachments if not is_inline(a[3])]
 
-        inlines  = [(n, d, m, c) for n, d, m, c in attachments
-                    if c and f"cid:{c}" in html]
-        regulars = [(n, d, m, c) for n, d, m, c in attachments
-                    if not (c and f"cid:{c}" in html)]
-
-        # Wrap HTML + inline images in multipart/related if needed
+        html_part = MIMEText(html, "html", "utf-8")
         if inlines:
             related = MIMEMultipart("related")
             related.attach(html_part)
             for name, data, mime_type, cid in inlines:
-                main_t, sub_t = mime_type.split("/", 1)
-                if main_t == "image":
-                    part = MIMEImage(data, _subtype=sub_t, name=name)
-                else:
-                    part = MIMEBase(main_t, sub_t)
-                    part.set_payload(data)
-                    encoders.encode_base64(part)
-                part.add_header("Content-ID", f"<{cid}>")
-                part.add_header("Content-Disposition", "inline")
-                related.attach(part)
+                related.attach(ScalertNotifier._make_part(
+                    name, data, mime_type, cid, "inline"))
             html_part = related
 
-        # Combine plain + html in multipart/alternative
         alt = MIMEMultipart("alternative")
-        alt.attach(plain_part)
+        alt.attach(MIMEText(plain, "plain", "utf-8"))
         alt.attach(html_part)
 
-        # Wrap in multipart/mixed if there are regular (non-inline) attachments
         if regulars:
             msg = MIMEMultipart("mixed")
             msg.attach(alt)
             for name, data, mime_type, _cid in regulars:
-                main_t, sub_t = mime_type.split("/", 1)
-                part = MIMEBase(main_t, sub_t)
-                part.set_payload(data)
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f'attachment; filename="{name}"')
-                msg.attach(part)
+                msg.attach(ScalertNotifier._make_part(name, data, mime_type))
         else:
             msg = alt
 
-        to_str = ", ".join(recipients) if isinstance(recipients, list) else recipients
         msg["From"]       = sender
-        msg["To"]         = to_str
+        msg["To"]         = ", ".join(recipients) if isinstance(recipients, list) else recipients
         msg["Subject"]    = subject
         msg["Date"]       = formatdate(localtime=True)
         msg["Message-ID"] = make_msgid(domain="seiscomp.local")
-
         return msg
 
 
