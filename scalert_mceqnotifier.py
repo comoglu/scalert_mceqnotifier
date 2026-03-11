@@ -26,12 +26,15 @@ CONFIG FILE: scalert_mceqnotifier.cfg (same directory as this script)
 from __future__ import absolute_import, division, print_function
 
 import configparser
+import glob as _glob_mod
+import json
 import math
 import os
 import smtplib
 import subprocess
 import sys
 import tempfile
+import time as _time
 import traceback
 from email import encoders
 from email.mime.base import MIMEBase
@@ -60,7 +63,9 @@ _DEFAULTS = {
     },
     "filter": {
         "min_magnitude":   "4.0",   # ignore events below this magnitude
-        "new_events_only": "false",  # if true, skip updates (is_new=0)
+        "max_magnitude":   "",      # ignore events above this magnitude (empty = no limit)
+        "min_arrivals":    "0",     # minimum number of arrivals to trigger (0 = disabled)
+        "new_events_only": "false", # if true, skip updates (is_new=0)
     },
     "seiscomp": {
         # Direct database connection for scxmldump (leave empty to use messaging)
@@ -97,6 +102,14 @@ _DEFAULTS = {
         "max_count":      "10",
         # Non-capital cities below this population are skipped
         "min_population": "10000",
+    },
+    "cooldown": {
+        "enabled":  "false",      # enable event deduplication cooldown
+        "seconds":  "300",        # suppress re-notification for same event within this window
+        "state_dir": "",          # directory for cooldown state files (empty = /tmp)
+    },
+    "logging": {
+        "level": "info",          # debug | info | warning | error
     },
 }
 
@@ -147,11 +160,29 @@ _EMAIL_CSS = (
     "padding:14px;border-top:1px solid #eee;}"
 )
 
-# Tiered tsunami risk messages (USGS/PTWC criteria)
-_TSUNAMI_MESSAGES = {
-    "POSSIBLE": "Shallow earthquake — tsunami possible but unlikely to be destructive.",
-    "LIKELY":   "Large shallow earthquake — destructive local tsunami likely.",
-    "EXPECTED": "Major shallow earthquake — destructive regional tsunami expected.",
+# PTWC four-level tsunami alert system
+# Ref: https://www.tsunami.gov/
+_TSUNAMI_TIERS = {
+    "WARNING": {
+        "color":   "#c0392b",
+        "message": "Dangerous coastal flooding and powerful currents. "
+                   "Move inland to high ground. Follow evacuation orders.",
+    },
+    "ADVISORY": {
+        "color":   "#d35400",
+        "message": "Strong currents and waves dangerous to those in or near water. "
+                   "Stay off beaches and away from harbors and marinas.",
+    },
+    "WATCH": {
+        "color":   "#b7950b",
+        "message": "Tsunami possible. Not yet confirmed — be prepared to take action. "
+                   "Stay alert for further information.",
+    },
+    "INFORMATION": {
+        "color":   "#2874a6",
+        "message": "Earthquake detected but no tsunami threat, or only very minor "
+                   "sea-level changes expected. No action required.",
+    },
 }
 
 
@@ -198,26 +229,29 @@ def _depth_info(depth_km):
 
 
 def _tsunami_risk(mag_val, depth_km):
-    """Estimate tsunami risk based on USGS/PTWC initial-assessment criteria.
+    """Estimate tsunami alert level based on PTWC criteria.
 
-    Returns: None | "POSSIBLE" | "LIKELY" | "EXPECTED"
+    Returns: None | "WARNING" | "ADVISORY" | "WATCH" | "INFORMATION"
 
-    Thresholds (shallow marine events only, depth < 100 km):
-      M < 6.5  → None   (very unlikely to trigger tsunami)
-      M 6.5–7.5 → POSSIBLE (rarely destructive, local effects)
-      M 7.6–7.8 → LIKELY   (destructive local tsunami)
-      M ≥ 7.9   → EXPECTED (destructive regional tsunami)
+    PTWC four-level system (shallow events, depth < 100 km):
+      M ≥ 7.6   → WARNING     (dangerous coastal flooding, evacuate)
+      M 7.0–7.5 → ADVISORY    (strong currents, stay off beaches)
+      M 6.5–6.9 → WATCH       (tsunami possible, be prepared)
+      M < 6.5   → INFORMATION  (no tsunami threat expected)
+
+    Deep events (≥ 100 km) return INFORMATION for M ≥ 6.5, None otherwise.
     """
     if mag_val is None or depth_km is None:
         return None
     if depth_km >= 100:
-        return None
-    if mag_val >= 7.9:
-        return "EXPECTED"
+        # Deep events rarely generate tsunamis; informational only for large ones
+        return "INFORMATION" if mag_val >= 6.5 else None
     if mag_val >= 7.6:
-        return "LIKELY"
+        return "WARNING"
+    if mag_val >= 7.0:
+        return "ADVISORY"
     if mag_val >= 6.5:
-        return "POSSIBLE"
+        return "WATCH"
     return None
 
 
@@ -296,19 +330,55 @@ def _get_taup_model():
     return _taup_model
 
 
-def _urgency(mag_val):
-    """Return (emoji, label, color1, color2) aligned with tsunami.gov alert colors."""
-    if mag_val is not None and mag_val >= 6.0:
-        return ("🔴", "WARNING",  "#c0392b", "#e74c3c")
-    if mag_val is not None and mag_val >= 5.0:
-        return ("🟠", "ADVISORY", "#d35400", "#e67e22")
-    if mag_val is not None and mag_val >= 4.0:
-        return ("🟡", "WATCH",    "#b7950b", "#d4ac0d")
-    return ("🟢", "INFO",         "#1e8449", "#27ae60")
+def _urgency(mag_val, tsunami_level=None):
+    """Return (emoji, label, color1, color2) aligned with PTWC alert colors.
+
+    Urgency is determined by magnitude, but elevated when a tsunami alert
+    level warrants a higher classification.
+
+    Color scheme matches tsunami.gov / NWS conventions:
+      WARNING     🔴 Red     — M≥7.0 or tsunami WARNING
+      ADVISORY    🟠 Orange  — M≥5.5 or tsunami ADVISORY
+      WATCH       🟡 Yellow  — M≥4.0 or tsunami WATCH
+      INFORMATION 🟢 Green   — below thresholds or tsunami INFORMATION
+    """
+    # Start with magnitude-based level
+    if mag_val is not None and mag_val >= 7.0:
+        level = 3  # WARNING
+    elif mag_val is not None and mag_val >= 5.5:
+        level = 2  # ADVISORY
+    elif mag_val is not None and mag_val >= 4.0:
+        level = 1  # WATCH
+    else:
+        level = 0  # INFORMATION
+
+    # Elevate if tsunami risk is higher
+    tsunami_levels = {"WARNING": 3, "ADVISORY": 2, "WATCH": 1, "INFORMATION": 0}
+    if tsunami_level and tsunami_levels.get(tsunami_level, 0) > level:
+        level = tsunami_levels[tsunami_level]
+
+    tiers = [
+        ("🟢", "INFORMATION", "#1e8449", "#27ae60"),
+        ("🟡", "WATCH",       "#b7950b", "#d4ac0d"),
+        ("🟠", "ADVISORY",    "#d35400", "#e67e22"),
+        ("🔴", "WARNING",     "#c0392b", "#e74c3c"),
+    ]
+    return tiers[level]
 
 
-def _log(msg):
-    print(f"[scalert_mceqnotifier] {msg}", file=sys.stderr)
+_LOG_LEVELS = {"debug": 0, "info": 1, "warning": 2, "error": 3}
+_log_level = 1  # default: info
+
+
+def _init_log_level(cfg):
+    global _log_level
+    level_str = cfg.get("logging", "level", fallback="info").strip().lower()
+    _log_level = _LOG_LEVELS.get(level_str, 1)
+
+
+def _log(msg, level="info"):
+    if _LOG_LEVELS.get(level, 1) >= _log_level:
+        print(f"[scalert_mceqnotifier] [{level.upper()}] {msg}", file=sys.stderr)
 
 
 def _run_sc_tool(cmd, input_data=None, output_suffix=None, timeout=30):
@@ -323,7 +393,7 @@ def _run_sc_tool(cmd, input_data=None, output_suffix=None, timeout=30):
     try:
         if out_path:
             cmd = [c.replace("{OUT}", out_path) for c in cmd]
-        _log(f"running: {' '.join(cmd)}")
+        _log(f"running: {' '.join(cmd)}", "debug")
         result = subprocess.run(
             cmd, input=input_data, capture_output=True, timeout=timeout)
         if result.returncode != 0:
@@ -361,7 +431,146 @@ def _load_cfg():
         _log(f"loaded config: {cfg_path}")
     else:
         _log(f"no config file at {cfg_path} — using defaults")
+    _init_log_level(cfg)
     return cfg
+
+
+def _parse_regions(cfg):
+    """Parse [region:NAME] sections from config.
+
+    Each region section supports:
+      enabled        (bool, default true)
+      lat_min, lat_max, lon_min, lon_max  (bounding box, required)
+      min_magnitude  (float, override global)
+      max_magnitude  (float, override global)
+      min_arrivals   (int, override global)
+      new_events_only (bool, override global)
+      to             (str, override recipients)
+
+    Returns list of region dicts.  Empty list means global-only mode.
+    """
+    regions = []
+    for section in cfg.sections():
+        if not section.startswith("region:"):
+            continue
+        name = section[len("region:"):]
+        if not cfg.getboolean(section, "enabled", fallback=True):
+            _log(f"region '{name}' disabled, skipping", "debug")
+            continue
+
+        try:
+            region = {
+                "name":     name,
+                "lat_min":  cfg.getfloat(section, "lat_min"),
+                "lat_max":  cfg.getfloat(section, "lat_max"),
+                "lon_min":  cfg.getfloat(section, "lon_min"),
+                "lon_max":  cfg.getfloat(section, "lon_max"),
+            }
+        except (configparser.NoOptionError, ValueError) as e:
+            _log(f"region '{name}' missing required bounds: {e}", "warning")
+            continue
+
+        # Per-region overrides (fall back to global [filter] values)
+        region["min_magnitude"] = cfg.getfloat(
+            section, "min_magnitude",
+            fallback=cfg.getfloat("filter", "min_magnitude"))
+        max_mag_str = cfg.get(section, "max_magnitude", fallback="").strip()
+        if not max_mag_str:
+            max_mag_str = cfg.get("filter", "max_magnitude", fallback="").strip()
+        region["max_magnitude"] = float(max_mag_str) if max_mag_str else None
+
+        region["min_arrivals"] = cfg.getint(
+            section, "min_arrivals",
+            fallback=cfg.getint("filter", "min_arrivals"))
+        region["new_events_only"] = cfg.getboolean(
+            section, "new_events_only",
+            fallback=cfg.getboolean("filter", "new_events_only"))
+
+        # Per-region recipients (empty = use global)
+        to_raw = cfg.get(section, "to", fallback="").strip()
+        region["recipients"] = [r.strip() for r in to_raw.split(",") if r.strip()] if to_raw else []
+
+        regions.append(region)
+        _log(f"region '{name}': lat[{region['lat_min']},{region['lat_max']}] "
+             f"lon[{region['lon_min']},{region['lon_max']}] "
+             f"min_mag={region['min_magnitude']} min_arr={region['min_arrivals']}", "debug")
+
+    return regions
+
+
+def _event_in_region(lat, lon, region):
+    """Check if lat/lon falls within a region's bounding box."""
+    return (region["lat_min"] <= lat <= region["lat_max"] and
+            region["lon_min"] <= lon <= region["lon_max"])
+
+
+# ---------------------------------------------------------------------------
+# Cooldown / deduplication
+# ---------------------------------------------------------------------------
+def _cooldown_state_dir(cfg):
+    d = cfg.get("cooldown", "state_dir", fallback="").strip()
+    if not d:
+        d = os.path.join(tempfile.gettempdir(), "scalert_mceqnotifier_cooldown")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _cooldown_check(cfg, event_id, region_name=None):
+    """Return True if notification should be suppressed (within cooldown window).
+
+    Also cleans up expired state files on each call.
+    """
+    if not cfg.getboolean("cooldown", "enabled", fallback=False):
+        return False
+
+    cooldown_secs = cfg.getint("cooldown", "seconds", fallback=300)
+    state_dir = _cooldown_state_dir(cfg)
+    now = _time.time()
+
+    # Clean expired state files
+    for fpath in _glob_mod.glob(os.path.join(state_dir, "*.json")):
+        try:
+            with open(fpath) as f:
+                data = json.load(f)
+            if now - data.get("timestamp", 0) > cooldown_secs * 2:
+                os.remove(fpath)
+        except Exception:
+            pass
+
+    # Check if this event+region combo was recently notified
+    key = f"{event_id}_{region_name or 'global'}"
+    # Sanitize key for filesystem
+    safe_key = "".join(c if c.isalnum() or c in "-_" else "_" for c in key)
+    state_file = os.path.join(state_dir, f"{safe_key}.json")
+
+    if os.path.isfile(state_file):
+        try:
+            with open(state_file) as f:
+                data = json.load(f)
+            if now - data.get("timestamp", 0) < cooldown_secs:
+                _log(f"cooldown active for {key} "
+                     f"({cooldown_secs - (now - data['timestamp']):.0f}s remaining)", "debug")
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _cooldown_record(cfg, event_id, region_name=None):
+    """Record that a notification was sent for this event+region."""
+    if not cfg.getboolean("cooldown", "enabled", fallback=False):
+        return
+    state_dir = _cooldown_state_dir(cfg)
+    key = f"{event_id}_{region_name or 'global'}"
+    safe_key = "".join(c if c.isalnum() or c in "-_" else "_" for c in key)
+    state_file = os.path.join(state_dir, f"{safe_key}.json")
+    try:
+        with open(state_file, "w") as f:
+            json.dump({"event_id": event_id, "region": region_name,
+                       "timestamp": _time.time()}, f)
+    except Exception as e:
+        _log(f"cooldown record failed: {e}", "warning")
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +582,7 @@ class ScalertNotifier:
 
     def __init__(self):
         self._cfg = _load_cfg()
+        self._regions = _parse_regions(self._cfg)
 
     # -----------------------------------------------------------------------
     def run(self, argv):
@@ -388,14 +598,16 @@ class ScalertNotifier:
             _log(f"usage: {argv[0]} <message> <is_new> <event_id> <n_arrivals> [magnitude]")
             return 1
 
-        message   = argv[1]
-        is_new    = argv[2].strip() == "1"
-        event_id  = argv[3].strip()
-        magnitude = float(argv[5]) if len(argv) > 5 and argv[5].strip() else None
+        message    = argv[1]
+        is_new     = argv[2].strip() == "1"
+        event_id   = argv[3].strip()
+        n_arrivals = int(argv[4]) if argv[4].strip() else 0
+        magnitude  = float(argv[5]) if len(argv) > 5 and argv[5].strip() else None
 
-        _log(f"triggered — event={event_id}  is_new={is_new}  mag={magnitude}")
+        _log(f"triggered — event={event_id}  is_new={is_new}  "
+             f"mag={magnitude}  arrivals={n_arrivals}")
 
-        # ── Filters ─────────────────────────────────────────────────────
+        # ── Global pre-fetch filters (quick reject before DB query) ─────
         if self._cfg.getboolean("filter", "new_events_only") and not is_new:
             _log(f"skipping update for {event_id} (new_events_only=true)")
             return 0
@@ -403,6 +615,16 @@ class ScalertNotifier:
         min_mag = self._cfg.getfloat("filter", "min_magnitude")
         if magnitude is not None and magnitude < min_mag:
             _log(f"skipping {event_id} M{magnitude:.1f} < threshold {min_mag}")
+            return 0
+
+        max_mag_str = self._cfg.get("filter", "max_magnitude").strip()
+        if max_mag_str and magnitude is not None and magnitude > float(max_mag_str):
+            _log(f"skipping {event_id} M{magnitude:.1f} > max threshold {max_mag_str}")
+            return 0
+
+        min_arr = self._cfg.getint("filter", "min_arrivals")
+        if min_arr > 0 and n_arrivals < min_arr:
+            _log(f"skipping {event_id} arrivals={n_arrivals} < threshold {min_arr}")
             return 0
 
         # ── Fetch event ──────────────────────────────────────────────────
@@ -419,7 +641,7 @@ class ScalertNotifier:
             _log(traceback.format_exc())
             return 1
 
-        # ── Build content ────────────────────────────────────────────────
+        # ── Build content (shared across all sends) ──────────────────────
         subject  = self._build_subject(ed)
         bd       = self._prepare_body_data(ed)
         bulletin = self._get_bulletin_text(ep)
@@ -439,15 +661,85 @@ class ScalertNotifier:
                 if att:
                     attachments.append(att)
 
-        # ── Send ─────────────────────────────────────────────────────────
-        try:
-            self._send(subject, plain, html, attachments)
-        except Exception as e:
-            _log(f"send failed: {e}")
-            _log(traceback.format_exc())
-            return 1
+        # ── Dispatch: region-based or global ─────────────────────────────
+        if self._regions:
+            sent = self._dispatch_regional(
+                ed, event_id, is_new, n_arrivals,
+                subject, plain, html, attachments)
+            if not sent:
+                _log(f"event {event_id} did not match any enabled region", "debug")
+            return 0
+        else:
+            # Global mode (backward-compatible)
+            if _cooldown_check(self._cfg, event_id):
+                _log(f"cooldown active for {event_id}, suppressing")
+                return 0
+            try:
+                self._send(subject, plain, html, attachments)
+                _cooldown_record(self._cfg, event_id)
+            except Exception as e:
+                _log(f"send failed: {e}")
+                _log(traceback.format_exc())
+                return 1
 
         return 0
+
+    # -----------------------------------------------------------------------
+    def _dispatch_regional(self, ed, event_id, is_new, n_arrivals,
+                           subject, plain, html, attachments):
+        """Send to each matching region with per-region filtering.
+
+        Returns True if at least one region was notified.
+        """
+        lat, lon = ed["lat"], ed["lon"]
+        mag_val = ed["mag_val"]
+        sent_any = False
+
+        for region in self._regions:
+            rname = region["name"]
+
+            if not _event_in_region(lat, lon, region):
+                _log(f"region '{rname}': event outside bounds", "debug")
+                continue
+
+            # Per-region new_events_only filter
+            if region["new_events_only"] and not is_new:
+                _log(f"region '{rname}': skipping update (new_events_only)", "debug")
+                continue
+
+            # Per-region magnitude filter
+            if mag_val is not None and mag_val < region["min_magnitude"]:
+                _log(f"region '{rname}': M{mag_val:.1f} < min {region['min_magnitude']}", "debug")
+                continue
+            if region["max_magnitude"] is not None and mag_val is not None:
+                if mag_val > region["max_magnitude"]:
+                    _log(f"region '{rname}': M{mag_val:.1f} > max {region['max_magnitude']}", "debug")
+                    continue
+
+            # Per-region arrivals filter
+            if region["min_arrivals"] > 0 and n_arrivals < region["min_arrivals"]:
+                _log(f"region '{rname}': arrivals={n_arrivals} < min {region['min_arrivals']}", "debug")
+                continue
+
+            # Cooldown check per region
+            if _cooldown_check(self._cfg, event_id, rname):
+                _log(f"region '{rname}': cooldown active for {event_id}", "debug")
+                continue
+
+            # Determine recipients
+            recipients = region["recipients"] if region["recipients"] else None
+
+            _log(f"region '{rname}': MATCH — sending notification")
+            try:
+                self._send(subject, plain, html, attachments,
+                           recipients_override=recipients)
+                _cooldown_record(self._cfg, event_id, rname)
+                sent_any = True
+            except Exception as e:
+                _log(f"region '{rname}': send failed: {e}")
+                _log(traceback.format_exc())
+
+        return sent_any
 
     # -----------------------------------------------------------------------
     # Event fetching
@@ -588,11 +880,12 @@ class ScalertNotifier:
         mag_val = ed["mag_val"]
         depth   = ed["depth"]
 
-        emoji, label, _, _ = _urgency(mag_val)
+        risk = _tsunami_risk(mag_val, depth)
+        emoji, label, _, _ = _urgency(mag_val, risk)
         urgency = f"{emoji} {label}".strip()
 
-        risk = _tsunami_risk(mag_val, depth)
-        tsunami_flag = f" ⚠️TSUNAMI {risk}" if risk else ""
+        tsunami_flag = (f" ⚠️TSUNAMI {risk}"
+                        if risk and risk != "INFORMATION" else "")
 
         mag_str   = f"M{mag_val:.1f} {ed['mag_type']}".strip() if mag_val is not None else "M?"
         depth_str = f"[{depth:.0f}km]" if depth is not None else ""
@@ -667,9 +960,10 @@ class ScalertNotifier:
             "",
         ]
 
-        if bd["tsunami_risk"]:
+        if bd["tsunami_risk"] and bd["tsunami_risk"] != "INFORMATION":
+            tier = _TSUNAMI_TIERS[bd["tsunami_risk"]]
             lines += [
-                f"⚠️  TSUNAMI {bd['tsunami_risk']}: {_TSUNAMI_MESSAGES[bd['tsunami_risk']]}",
+                f"⚠️  TSUNAMI {bd['tsunami_risk']}: {tier['message']}",
                 "   Monitor official warnings (PTWC, NTWC, and regional agencies).",
                 "",
             ]
@@ -718,7 +1012,7 @@ class ScalertNotifier:
         region   = _he(ed["region"] or "Unknown region")
         time_disp = _he(_fmt_time(ed["time"]))
 
-        urgency_emoji, _, hdr_c1, hdr_c2 = _urgency(ed["mag_val"])
+        urgency_emoji, _, hdr_c1, hdr_c2 = _urgency(ed["mag_val"], bd["tsunami_risk"])
 
         depth_badge_bg = {
             "Shallow": "#e74c3c",
@@ -737,13 +1031,15 @@ class ScalertNotifier:
             f"<p>{time_disp}</p><p>{region}</p>"
             "</div>")
 
-        tsunami_banner = (
-            '<div class="tsunami">'
-            f"⚠️ TSUNAMI {bd['tsunami_risk']} — "
-            f"{_TSUNAMI_MESSAGES[bd['tsunami_risk']]} "
-            "Monitor official warnings from PTWC, NTWC, and regional agencies."
-            "</div>"
-        ) if bd["tsunami_risk"] else ""
+        if bd["tsunami_risk"] and bd["tsunami_risk"] != "INFORMATION":
+            tier = _TSUNAMI_TIERS[bd["tsunami_risk"]]
+            tsunami_banner = (
+                f'<div class="tsunami" style="background:{tier["color"]}">'
+                f"⚠️ TSUNAMI {bd['tsunami_risk']} — {tier['message']} "
+                "Monitor official warnings from PTWC, NTWC, and regional agencies."
+                "</div>")
+        else:
+            tsunami_banner = ""
 
         evt_tbl = (
             "<h3>Event Parameters</h3>"
@@ -1090,8 +1386,13 @@ class ScalertNotifier:
     # -----------------------------------------------------------------------
     # SMTP sending
     # -----------------------------------------------------------------------
-    def _send(self, subject, plain, html, attachments):
-        """Build MIME message and send via SMTP."""
+    def _send(self, subject, plain, html, attachments,
+              recipients_override=None):
+        """Build MIME message and send via SMTP.
+
+        If recipients_override is provided, send to those addresses instead
+        of the global [smtp] to= list.
+        """
         s   = self._cfg
         srv = s.get("smtp", "server")
         port = s.getint("smtp", "port")
@@ -1100,11 +1401,15 @@ class ScalertNotifier:
         user    = s.get("smtp", "user")
         pw      = s.get("smtp", "pw")
         sender  = s.get("smtp", "from") or user
-        to_raw  = s.get("smtp", "to")
-        recipients = [r.strip() for r in to_raw.split(",") if r.strip()]
+
+        if recipients_override:
+            recipients = recipients_override
+        else:
+            to_raw  = s.get("smtp", "to")
+            recipients = [r.strip() for r in to_raw.split(",") if r.strip()]
 
         if not recipients:
-            _log("no recipients configured in [smtp] to =")
+            _log("no recipients configured")
             return
 
         msg = self._build_mime(subject, sender, recipients, plain, html, attachments)

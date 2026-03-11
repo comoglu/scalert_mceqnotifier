@@ -17,7 +17,7 @@ pw   = your-app-password
 # Sender address (usually same as user)
 from = your-email@gmail.com
 
-# Recipient list — comma-separated
+# Recipient list — comma-separated (used when no region-specific recipients match)
 to = recipient1@example.com,recipient2@example.com
 
 # Connection timeout in seconds (prevents hanging when firewall/VPN blocks SMTP)
@@ -26,6 +26,13 @@ timeout = 30
 [filter]
 # Minimum magnitude to send a notification (events below this are silently ignored)
 min_magnitude = 4.0
+
+# Maximum magnitude (leave empty for no upper limit — useful for testing)
+# max_magnitude =
+
+# Minimum number of phase arrivals to trigger notification (0 = disabled)
+# Increase this to suppress poorly-constrained events (e.g. 10 or 15)
+min_arrivals = 0
 
 # Set to true to only notify on NEW events (skip updates)
 new_events_only = true
@@ -82,3 +89,69 @@ max_count = 10
 
 # Ignore non-capital cities with population below this threshold
 min_population = 300000
+
+[cooldown]
+# Prevent duplicate notifications for the same event within a time window.
+# Useful when scalert fires rapid updates as the location/magnitude refines.
+enabled  = false
+seconds  = 300
+# Directory for cooldown state files (leave empty for /tmp/scalert_mceqnotifier_cooldown)
+# state_dir =
+
+[logging]
+# Log verbosity: debug | info | warning | error
+level = info
+
+# ---------------------------------------------------------------------------
+# REGION-BASED FILTERING (optional)
+# ---------------------------------------------------------------------------
+# Define [region:NAME] sections to set up geographic filtering with per-region
+# overrides for magnitude, arrivals, recipients, etc.
+#
+# When regions are defined:
+#   - Each event is checked against all enabled regions
+#   - A region matches if the epicenter falls within its bounding box
+#   - Each matching region can have its own thresholds and recipient list
+#   - An event can match MULTIPLE regions (each gets its own notification)
+#   - Events outside all regions are silently dropped
+#
+# When NO regions are defined:
+#   - All events use the global [filter] settings (backward-compatible)
+#
+# Per-region settings override the global [filter] equivalents.
+# If a per-region setting is omitted, the global value is used as fallback.
+#
+# Example regions:
+#
+# [region:Turkey]
+# enabled = true
+# lat_min = 35.0
+# lat_max = 43.0
+# lon_min = 25.0
+# lon_max = 45.0
+# min_magnitude = 3.0
+# min_arrivals = 8
+# # Per-region recipients (optional — omit to use global [smtp] to=)
+# to = turkey-team@example.com,ops@example.com
+#
+# [region:Greece]
+# enabled = true
+# lat_min = 34.0
+# lat_max = 42.0
+# lon_min = 19.0
+# lon_max = 30.0
+# min_magnitude = 3.5
+# min_arrivals = 5
+# new_events_only = false
+# to = greece-team@example.com
+#
+# [region:Global-Large]
+# # Catch large events worldwide (use wide bounds)
+# enabled = true
+# lat_min = -90.0
+# lat_max = 90.0
+# lon_min = -180.0
+# lon_max = 180.0
+# min_magnitude = 6.0
+# min_arrivals = 20
+# to = management@example.com
