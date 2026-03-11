@@ -641,6 +641,15 @@ class ScalertNotifier:
             _log(traceback.format_exc())
             return 1
 
+        # ── Handle "not existing" / false events ────────────────────────
+        if ed["event_type"] == "not existing":
+            if is_new:
+                _log(f"suppressing new event {event_id} (type=not existing)")
+                return 0
+            # Update → send retraction to all applicable recipients
+            _log(f"event {event_id} marked as 'not existing' — sending retraction")
+            return self._send_retraction(ed)
+
         # ── Build content (shared across all sends) ──────────────────────
         subject  = self._build_subject(ed)
         bd       = self._prepare_body_data(ed)
@@ -742,6 +751,121 @@ class ScalertNotifier:
         return sent_any
 
     # -----------------------------------------------------------------------
+    # Retraction / "not existing" event notification
+    # -----------------------------------------------------------------------
+    def _send_retraction(self, ed):
+        """Send a retraction email when an event is marked as 'not existing'.
+
+        Notifies all applicable recipients (global + all matching regions)
+        that a previously disseminated event has been reviewed and cancelled.
+        Returns 0 on success, 1 on failure.
+        """
+        short_id = ed["id"].split("/")[-1] if "/" in ed["id"] else ed["id"]
+        region   = ed["region"] or "Unknown region"
+        mag_str  = (f"M{ed['mag_val']:.1f} {ed['mag_type']}".strip()
+                    if ed["mag_val"] is not None else "M?")
+        time_str = _fmt_time(ed["time"])
+
+        subject = (f"⚫ CANCELLED — {mag_str} - {region} [{short_id[:20]}] "
+                   "— event marked as not existing")
+
+        plain = "\n".join([
+            "EVENT RETRACTION / CANCELLATION",
+            "=" * 56,
+            "",
+            f"EVENT ID  : {ed['id']}",
+            f"STATUS    : ❌ NOT EXISTING (false / cancelled event)",
+            "",
+            f"TIME (UTC): {time_str}",
+            f"REGION    : {region}",
+            f"LATITUDE  : {ed['lat']:.4f}°",
+            f"LONGITUDE : {ed['lon']:.4f}°",
+            f"MAGNITUDE : {mag_str}  (at time of cancellation)",
+            "",
+            "This event has been reviewed and marked as NOT EXISTING.",
+            "The original alert should be DISREGARDED.",
+            "",
+            "This may indicate:",
+            "  • A false detection (noise, blast, or calibration signal)",
+            "  • A duplicate event that has been merged with another",
+            "  • An analyst review that determined no real earthquake occurred",
+            "",
+            "No further notifications will be sent for this event.",
+            "",
+            "=" * 56,
+            self._cfg.get("content", "footer"),
+        ])
+
+        hdr_rule = (".hdr{padding:28px 20px;text-align:center;"
+                    "background:linear-gradient(135deg,#2c3e50,#4a6274);color:#fff;}")
+        css = f"<style>{_EMAIL_CSS}{hdr_rule}</style>"
+
+        html = (
+            "<!DOCTYPE html><html>"
+            '<head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f"{css}</head>"
+            '<body><div class="wrap">'
+            '<div class="hdr">'
+            "<h1>🌏 Earthquake Notification</h1>"
+            "<h2>⚫ EVENT CANCELLED</h2>"
+            f"<p>{_he(mag_str)} — {_he(region)}</p>"
+            f"<p>{_he(time_str)}</p>"
+            "</div>"
+            '<div style="background:#e74c3c;color:#fff;padding:16px 20px;'
+            'text-align:center;font-size:15px;font-weight:bold;">'
+            "❌ This event has been reviewed and marked as NOT EXISTING. "
+            "The original alert should be DISREGARDED."
+            "</div>"
+            '<div class="body">'
+            "<h3>Retraction Details</h3>"
+            '<table class="ev">'
+            f'<tr><td class="lbl">Event ID</td><td>{_he(short_id)}</td></tr>'
+            f'<tr><td class="lbl">Status</td><td><span class="badge" '
+            f'style="background:#e74c3c">NOT EXISTING</span></td></tr>'
+            f'<tr><td class="lbl">Origin Time</td><td>{_he(time_str)}</td></tr>'
+            f'<tr><td class="lbl">Region</td><td>{_he(region)}</td></tr>'
+            f'<tr><td class="lbl">Latitude</td><td>{ed["lat"]:.4f}&deg;</td></tr>'
+            f'<tr><td class="lbl">Longitude</td><td>{ed["lon"]:.4f}&deg;</td></tr>'
+            f'<tr><td class="lbl">Magnitude (at cancellation)</td>'
+            f'<td>{_he(mag_str)}</td></tr>'
+            "</table>"
+            "<h3>What does this mean?</h3>"
+            "<ul>"
+            "<li>A false detection (noise, blast, or calibration signal)</li>"
+            "<li>A duplicate event merged with another</li>"
+            "<li>An analyst review determined no real earthquake occurred</li>"
+            "</ul>"
+            "<p>No further notifications will be sent for this event.</p>"
+            f'<div class="foot">{_he(self._cfg.get("content", "footer"))}</div>'
+            "</div></div></body></html>"
+        )
+
+        failed = False
+
+        if self._regions:
+            # Send retraction to all regions whose bounding box matches
+            lat, lon = ed["lat"], ed["lon"]
+            for region_cfg in self._regions:
+                if not _event_in_region(lat, lon, region_cfg):
+                    continue
+                recipients = region_cfg["recipients"] if region_cfg["recipients"] else None
+                try:
+                    self._send(subject, plain, html, [],
+                               recipients_override=recipients)
+                except Exception as e:
+                    _log(f"retraction send failed for region '{region_cfg['name']}': {e}")
+                    failed = True
+        else:
+            try:
+                self._send(subject, plain, html, [])
+            except Exception as e:
+                _log(f"retraction send failed: {e}")
+                failed = True
+
+        return 1 if failed else 0
+
+    # -----------------------------------------------------------------------
     # Event fetching
     # -----------------------------------------------------------------------
     def _fetch_event(self, event_id):
@@ -796,18 +920,25 @@ class ScalertNotifier:
 
         event = ep.event(0)
         ed = {
-            "id":       event.publicID(),
-            "region":   "",
-            "lat":      0.0,
-            "lon":      0.0,
-            "depth":    None,
-            "phases":   0,
-            "time":     "",
-            "mag_val":  None,
-            "mag_type": "",
-            "arrivals": [],
-            "map_cid":  None,
+            "id":         event.publicID(),
+            "region":     "",
+            "lat":        0.0,
+            "lon":        0.0,
+            "depth":      None,
+            "phases":     0,
+            "time":       "",
+            "mag_val":    None,
+            "mag_type":   "",
+            "arrivals":   [],
+            "map_cid":    None,
+            "event_type": None,   # SeisComP EventType string (e.g. "not existing")
         }
+
+        # Extract event type (e.g. NOT_EXISTING, EARTHQUAKE, etc.)
+        try:
+            ed["event_type"] = datamodel.EEventTypeNames.name(event.type())
+        except (ValueError, AttributeError):
+            pass
 
         for i in range(event.eventDescriptionCount()):
             desc = event.eventDescription(i)

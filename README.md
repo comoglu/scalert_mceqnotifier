@@ -34,6 +34,16 @@ The email header color and subject line label are determined by magnitude and ts
 
 The tsunami banner (WARNING/ADVISORY/WATCH) only appears for shallow events (< 100 km) with M ≥ 6.5. Deep events receive INFORMATION level with no banner.
 
+### Event Retraction ("not existing")
+
+When an analyst reviews a false or duplicate event in SeisComP and sets its type to `not existing`, the script automatically sends a **retraction email** to all applicable recipients. The retraction:
+
+- Uses a distinct `⚫ CANCELLED` subject line so it stands out in inboxes
+- Includes a prominent red banner: "This event has been reviewed and marked as NOT EXISTING"
+- Explains possible reasons (false detection, duplicate, analyst review)
+- Sends to all matching region recipients (or global recipients)
+- Suppresses new events that arrive already marked as `not existing`
+
 ## Prerequisites
 
 - **SeisComP** (>= 4.x) with the following modules available on `$PATH`:
