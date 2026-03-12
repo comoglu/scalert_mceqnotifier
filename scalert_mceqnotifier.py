@@ -331,39 +331,32 @@ def _get_taup_model():
 
 
 def _urgency(mag_val, tsunami_level=None):
-    """Return (emoji, label, color1, color2) aligned with PTWC alert colors.
+    """Return (emoji, label, color1, color2) for email styling.
 
-    Urgency is determined by magnitude, but elevated when a tsunami alert
-    level warrants a higher classification.
+    PTWC alert colors and labels are ONLY used when a tsunami alert level
+    is active (WARNING, ADVISORY, WATCH, or INFORMATION).  When there is
+    no tsunami risk, a neutral steel-blue header is used with no PTWC label
+    so recipients are not misled into thinking a tsunami alert exists.
 
-    Color scheme matches tsunami.gov / NWS conventions:
-      WARNING     🔴 Red     — M≥7.0 or tsunami WARNING
-      ADVISORY    🟠 Orange  — M≥5.5 or tsunami ADVISORY
-      WATCH       🟡 Yellow  — M≥4.0 or tsunami WATCH
-      INFORMATION 🟢 Green   — below thresholds or tsunami INFORMATION
+    PTWC color scheme (tsunami events only):
+      WARNING     🔴 Red     — dangerous flooding, evacuate
+      ADVISORY    🟠 Orange  — strong currents, stay off beaches
+      WATCH       🟡 Yellow  — tsunami possible, be prepared
+      INFORMATION 🟢 Green   — no threat expected
     """
-    # Start with magnitude-based level
-    if mag_val is not None and mag_val >= 7.0:
-        level = 3  # WARNING
-    elif mag_val is not None and mag_val >= 5.5:
-        level = 2  # ADVISORY
-    elif mag_val is not None and mag_val >= 4.0:
-        level = 1  # WATCH
-    else:
-        level = 0  # INFORMATION
+    # Neutral default (no tsunami risk)
+    _NEUTRAL = ("🌍", "", "#2c3e50", "#34495e")
 
-    # Elevate if tsunami risk is higher
-    tsunami_levels = {"WARNING": 3, "ADVISORY": 2, "WATCH": 1, "INFORMATION": 0}
-    if tsunami_level and tsunami_levels.get(tsunami_level, 0) > level:
-        level = tsunami_levels[tsunami_level]
+    if not tsunami_level:
+        return _NEUTRAL
 
-    tiers = [
-        ("🟢", "INFORMATION", "#1e8449", "#27ae60"),
-        ("🟡", "WATCH",       "#b7950b", "#d4ac0d"),
-        ("🟠", "ADVISORY",    "#d35400", "#e67e22"),
-        ("🔴", "WARNING",     "#c0392b", "#e74c3c"),
-    ]
-    return tiers[level]
+    tiers = {
+        "INFORMATION": ("🟢", "INFORMATION", "#1e8449", "#27ae60"),
+        "WATCH":       ("🟡", "WATCH",       "#b7950b", "#d4ac0d"),
+        "ADVISORY":    ("🟠", "ADVISORY",    "#d35400", "#e67e22"),
+        "WARNING":     ("🔴", "WARNING",     "#c0392b", "#e74c3c"),
+    }
+    return tiers.get(tsunami_level, _NEUTRAL)
 
 
 _LOG_LEVELS = {"debug": 0, "info": 1, "warning": 2, "error": 3}
@@ -1013,10 +1006,14 @@ class ScalertNotifier:
 
         risk = _tsunami_risk(mag_val, depth)
         emoji, label, _, _ = _urgency(mag_val, risk)
-        urgency = f"{emoji} {label}".strip()
 
-        tsunami_flag = (f" ⚠️TSUNAMI {risk}"
-                        if risk and risk != "INFORMATION" else "")
+        # PTWC label + tsunami flag only when tsunami risk is active
+        if risk and risk != "INFORMATION":
+            urgency = f"{emoji} {label} ⚠️TSUNAMI {risk}"
+        elif risk == "INFORMATION":
+            urgency = f"{emoji} {label}"
+        else:
+            urgency = ""
 
         mag_str   = f"M{mag_val:.1f} {ed['mag_type']}".strip() if mag_val is not None else "M?"
         depth_str = f"[{depth:.0f}km]" if depth is not None else ""
@@ -1028,7 +1025,7 @@ class ScalertNotifier:
         short_id = ed["id"].split("/")[-1] if "/" in ed["id"] else ed["id"]
         short_id = short_id[:20]
 
-        parts = [urgency + tsunami_flag, f"🚨 {mag_str}", depth_str]
+        parts = [urgency, f"🚨 {mag_str}", depth_str]
         if time_str:
             parts.append(f"@ {time_str}")
         parts += [f"- {region}", f"[{short_id}]"]
@@ -1091,7 +1088,7 @@ class ScalertNotifier:
             "",
         ]
 
-        if bd["tsunami_risk"] and bd["tsunami_risk"] != "INFORMATION":
+        if bd["tsunami_risk"]:
             tier = _TSUNAMI_TIERS[bd["tsunami_risk"]]
             lines += [
                 f"⚠️  TSUNAMI {bd['tsunami_risk']}: {tier['message']}",
@@ -1162,7 +1159,7 @@ class ScalertNotifier:
             f"<p>{time_disp}</p><p>{region}</p>"
             "</div>")
 
-        if bd["tsunami_risk"] and bd["tsunami_risk"] != "INFORMATION":
+        if bd["tsunami_risk"]:
             tier = _TSUNAMI_TIERS[bd["tsunami_risk"]]
             tsunami_banner = (
                 f'<div class="tsunami" style="background:{tier["color"]}">'
