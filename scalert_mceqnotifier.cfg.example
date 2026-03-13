@@ -101,6 +101,9 @@ seconds  = 300
 [logging]
 # Log verbosity: debug | info | warning | error
 level = info
+# Directory for per-event log files (one file per run: mceqnotifier_<eventID>_<timestamp>.log)
+# Leave empty to disable file logging (output goes to stderr / scalert.log only)
+# log_dir = /home/sysop/.seiscomp/log/mceqnotifier
 
 # ---------------------------------------------------------------------------
 # REGION-BASED FILTERING (optional)
@@ -120,6 +123,16 @@ level = info
 #
 # Per-region settings override the global [filter] equivalents.
 # If a per-region setting is omitted, the global value is used as fallback.
+#
+# PTWC Tsunami Alert Levels (automatically computed for shallow events):
+#   WARNING     — M >= 7.6, depth < 100 km (dangerous flooding, evacuate)
+#   ADVISORY    — M 7.0-7.5, depth < 100 km (strong currents, stay off beaches)
+#   WATCH       — M 6.5-6.9, depth < 100 km (tsunami possible, be prepared)
+#   INFORMATION — M < 6.5 or depth >= 100 km (no threat expected)
+#
+# Event Retraction:
+#   If an event is set to type "not existing" by an analyst, a retraction
+#   email is automatically sent to notify recipients the alert was a false alarm.
 #
 # Example regions:
 #
