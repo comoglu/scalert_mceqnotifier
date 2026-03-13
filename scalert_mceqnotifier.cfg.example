@@ -106,7 +106,7 @@ seconds  = 300
 level = info
 # Directory for per-event log files (one file per run: mceqnotifier_<eventID>_<timestamp>.log)
 # Leave empty to disable file logging (output goes to stderr / scalert.log only)
-# log_dir = /home/sysop/.seiscomp/log/mceqnotifier
+# log_dir = ~/.seiscomp/log/mceqnotifier
 
 # ---------------------------------------------------------------------------
 # REGION-BASED FILTERING (optional)

@@ -386,6 +386,7 @@ def _init_log_file(cfg, event_id):
     log_dir = cfg.get("logging", "log_dir", fallback="").strip()
     if not log_dir:
         return
+    log_dir = os.path.expandvars(os.path.expanduser(log_dir))
     os.makedirs(log_dir, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     log_path = os.path.join(log_dir, f"mceqnotifier_{event_id}_{ts}.log")
@@ -550,6 +551,7 @@ def _cooldown_state_dir(cfg):
     d = cfg.get("cooldown", "state_dir", fallback="").strip()
     if not d:
         d = os.path.join(tempfile.gettempdir(), "scalert_mceqnotifier_cooldown")
+    d = os.path.expandvars(os.path.expanduser(d))
     os.makedirs(d, exist_ok=True)
     return d
 
