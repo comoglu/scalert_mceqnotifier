@@ -37,6 +37,15 @@ min_arrivals = 0
 # Set to true to only notify on NEW events (skip updates)
 new_events_only = true
 
+# Seconds to keep retrying a new event that initially failed filters
+# (e.g. too few arrivals on first trigger). Updates within this window
+# bypass new_events_only so the event gets another chance. (0 = disabled)
+pending_timeout = 600
+
+# Send an UPDATE email when magnitude changes by at least this much
+# from the last notification (0 = disabled). Works with new_events_only=true.
+update_magnitude_change = 0.3
+
 [seiscomp]
 # Direct database connection for scxmldump (recommended — avoids messaging dependency)
 # Adjust user, password, host, and database name to match your SeisComP setup

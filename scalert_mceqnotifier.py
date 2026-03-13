@@ -74,6 +74,8 @@ _DEFAULTS = {
         "max_magnitude":   "",      # ignore events above this magnitude (empty = no limit)
         "min_arrivals":    "0",     # minimum number of arrivals to trigger (0 = disabled)
         "new_events_only": "false", # if true, skip updates (is_new=0)
+        "pending_timeout": "600",   # seconds to allow updates for new events that failed filters
+        "update_magnitude_change": "0.3",  # send UPDATE email if mag changes by this much (0 = disabled)
     },
     "seiscomp": {
         # Direct database connection for scxmldump (leave empty to use messaging)
@@ -615,6 +617,117 @@ def _cooldown_record(cfg, event_id, region_name=None):
 
 
 # ---------------------------------------------------------------------------
+# Notified-event state — tracks last-sent magnitude per event so we can
+# detect significant magnitude changes and send UPDATE emails.
+# ---------------------------------------------------------------------------
+def _notified_state_dir(cfg):
+    """Return (and create) the directory for notified-event state files."""
+    d = cfg.get("cooldown", "state_dir", fallback="").strip()
+    if not d:
+        d = os.path.join(tempfile.gettempdir(), "scalert_mceqnotifier_cooldown")
+    d = os.path.expandvars(os.path.expanduser(d))
+    d = os.path.join(d, "notified")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _notified_record(cfg, event_id, magnitude):
+    """Record the magnitude that was notified for this event."""
+    state_dir = _notified_state_dir(cfg)
+    safe_key = "".join(c if c.isalnum() or c in "-_" else "_" for c in event_id)
+    state_file = os.path.join(state_dir, f"{safe_key}.json")
+    try:
+        with open(state_file, "w") as f:
+            json.dump({"event_id": event_id, "magnitude": magnitude,
+                       "timestamp": _time.time()}, f)
+    except Exception as e:
+        _log(f"notified record failed: {e}", "warning")
+
+
+def _notified_get_magnitude(cfg, event_id):
+    """Return the last-notified magnitude for this event, or None if not found."""
+    state_dir = _notified_state_dir(cfg)
+    safe_key = "".join(c if c.isalnum() or c in "-_" else "_" for c in event_id)
+    state_file = os.path.join(state_dir, f"{safe_key}.json")
+    if not os.path.isfile(state_file):
+        return None
+    try:
+        with open(state_file) as f:
+            data = json.load(f)
+        return data.get("magnitude")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pending-event state — allows updates to bypass new_events_only when the
+# initial (is_new=True) trigger failed a filter (e.g. too few arrivals).
+# Without this, a new event that initially lacks enough arrivals is
+# permanently silenced because all subsequent updates are blocked.
+# Pending state expires after pending_timeout seconds (default 600 = 10 min).
+# ---------------------------------------------------------------------------
+def _pending_state_dir(cfg):
+    """Return (and create) the directory for pending-event state files."""
+    d = cfg.get("cooldown", "state_dir", fallback="").strip()
+    if not d:
+        d = os.path.join(tempfile.gettempdir(), "scalert_mceqnotifier_cooldown")
+    d = os.path.expandvars(os.path.expanduser(d))
+    # Use a subdirectory to keep pending files separate from cooldown files
+    d = os.path.join(d, "pending")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _pending_mark(cfg, event_id):
+    """Mark an event as pending (new but failed filters, allow future updates)."""
+    state_dir = _pending_state_dir(cfg)
+    safe_key = "".join(c if c.isalnum() or c in "-_" else "_" for c in event_id)
+    state_file = os.path.join(state_dir, f"{safe_key}.json")
+    try:
+        with open(state_file, "w") as f:
+            json.dump({"event_id": event_id,
+                       "timestamp": _time.time()}, f)
+        _log(f"marked {event_id} as pending (will allow updates)", "debug")
+    except Exception as e:
+        _log(f"pending mark failed: {e}", "warning")
+
+
+def _pending_check(cfg, event_id):
+    """Return True if this event is pending (new but previously failed filters)."""
+    state_dir = _pending_state_dir(cfg)
+    safe_key = "".join(c if c.isalnum() or c in "-_" else "_" for c in event_id)
+    state_file = os.path.join(state_dir, f"{safe_key}.json")
+    if not os.path.isfile(state_file):
+        return False
+    try:
+        with open(state_file) as f:
+            data = json.load(f)
+        timeout = cfg.getint("filter", "pending_timeout", fallback=600)
+        age = _time.time() - data.get("timestamp", 0)
+        if age > timeout:
+            os.remove(state_file)
+            _log(f"pending state expired for {event_id} "
+                 f"(age={age:.0f}s > {timeout}s)", "debug")
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _pending_clear(cfg, event_id):
+    """Remove pending state for an event (notification was sent)."""
+    state_dir = _pending_state_dir(cfg)
+    safe_key = "".join(c if c.isalnum() or c in "-_" else "_" for c in event_id)
+    state_file = os.path.join(state_dir, f"{safe_key}.json")
+    try:
+        if os.path.isfile(state_file):
+            os.remove(state_file)
+            _log(f"cleared pending state for {event_id}", "debug")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 class ScalertNotifier:
     """
     Standalone scalert earthquake email notifier.
@@ -660,9 +773,26 @@ class ScalertNotifier:
              f"mag={magnitude}  arrivals={n_arrivals}")
 
         # ── Global pre-fetch filters (quick reject before DB query) ─────
+        is_mag_update = False
         if self._cfg.getboolean("filter", "new_events_only") and not is_new:
-            _log(f"skipping update for {event_id} (new_events_only=true)")
-            return 0
+            if _pending_check(self._cfg, event_id):
+                _log(f"event {event_id} is pending — allowing update through")
+            else:
+                # Check for significant magnitude change
+                mag_delta = self._cfg.getfloat(
+                    "filter", "update_magnitude_change", fallback=0.0)
+                prev_mag = _notified_get_magnitude(self._cfg, event_id)
+                if (mag_delta > 0 and magnitude is not None
+                        and prev_mag is not None
+                        and abs(magnitude - prev_mag) >= mag_delta):
+                    _log(f"event {event_id} magnitude changed "
+                         f"M{prev_mag:.1f} → M{magnitude:.1f} "
+                         f"(delta={abs(magnitude - prev_mag):.1f} >= "
+                         f"{mag_delta:.1f}) — sending update")
+                    is_mag_update = True
+                else:
+                    _log(f"skipping update for {event_id} (new_events_only=true)")
+                    return 0
 
         min_mag = self._cfg.getfloat("filter", "min_magnitude")
         if magnitude is not None and magnitude < min_mag:
@@ -702,7 +832,23 @@ class ScalertNotifier:
         min_arr = self._cfg.getint("filter", "min_arrivals")
         if min_arr > 0 and n_arrivals < min_arr:
             _log(f"skipping {event_id} arrivals={n_arrivals} < threshold {min_arr}")
+            if is_new:
+                _pending_mark(self._cfg, event_id)
             return 0
+
+        # ── Re-check magnitude change with authoritative XML magnitude ──
+        if is_mag_update:
+            mag_delta = self._cfg.getfloat(
+                "filter", "update_magnitude_change", fallback=0.0)
+            prev_mag = _notified_get_magnitude(self._cfg, event_id)
+            xml_mag = ed.get("mag_val")
+            if (prev_mag is not None and xml_mag is not None
+                    and abs(xml_mag - prev_mag) < mag_delta):
+                _log(f"XML magnitude M{xml_mag:.1f} vs notified M{prev_mag:.1f} "
+                     f"delta={abs(xml_mag - prev_mag):.1f} < {mag_delta:.1f} "
+                     f"— update not warranted after all")
+                is_mag_update = False
+                return 0
 
         # ── Handle "not existing" / false events ────────────────────────
         if ed["event_type"] == "not existing":
@@ -714,7 +860,7 @@ class ScalertNotifier:
             return self._send_retraction(ed)
 
         # ── Build content (shared across all sends) ──────────────────────
-        subject  = self._build_subject(ed)
+        subject  = self._build_subject(ed, is_update=is_mag_update)
         bd       = self._prepare_body_data(ed)
         bulletin = self._get_bulletin_text(ep)
         map_att  = self._gen_map(ed, xml_bytes)
@@ -738,8 +884,11 @@ class ScalertNotifier:
         if self._regions:
             sent = self._dispatch_regional(
                 ed, event_id, is_new, n_arrivals,
-                subject, plain, html, attachments)
-            if not sent:
+                subject, plain, html, attachments,
+                is_mag_update=is_mag_update)
+            if sent:
+                _notified_record(self._cfg, event_id, ed.get("mag_val"))
+            else:
                 _log(f"event {event_id} did not match any enabled region", "debug")
             return 0
         else:
@@ -750,6 +899,8 @@ class ScalertNotifier:
             try:
                 self._send(subject, plain, html, attachments)
                 _cooldown_record(self._cfg, event_id)
+                _pending_clear(self._cfg, event_id)
+                _notified_record(self._cfg, event_id, ed.get("mag_val"))
             except Exception as e:
                 _log(f"send failed: {e}")
                 _log(traceback.format_exc())
@@ -759,7 +910,8 @@ class ScalertNotifier:
 
     # -----------------------------------------------------------------------
     def _dispatch_regional(self, ed, event_id, is_new, n_arrivals,
-                           subject, plain, html, attachments):
+                           subject, plain, html, attachments,
+                           is_mag_update=False):
         """Send to each matching region with per-region filtering.
 
         Returns True if at least one region was notified.
@@ -776,13 +928,17 @@ class ScalertNotifier:
                 continue
 
             # Per-region new_events_only filter
-            if region["new_events_only"] and not is_new:
+            is_pending = _pending_check(self._cfg, event_id)
+            if (region["new_events_only"] and not is_new
+                    and not is_pending and not is_mag_update):
                 _log(f"region '{rname}': skipping update (new_events_only)", "debug")
                 continue
 
             # Per-region magnitude filter
             if mag_val is not None and mag_val < region["min_magnitude"]:
                 _log(f"region '{rname}': M{mag_val:.1f} < min {region['min_magnitude']}", "debug")
+                if is_new:
+                    _pending_mark(self._cfg, event_id)
                 continue
             if region["max_magnitude"] is not None and mag_val is not None:
                 if mag_val > region["max_magnitude"]:
@@ -792,6 +948,8 @@ class ScalertNotifier:
             # Per-region arrivals filter
             if region["min_arrivals"] > 0 and n_arrivals < region["min_arrivals"]:
                 _log(f"region '{rname}': arrivals={n_arrivals} < min {region['min_arrivals']}", "debug")
+                if is_new:
+                    _pending_mark(self._cfg, event_id)
                 continue
 
             # Cooldown check per region
@@ -807,6 +965,7 @@ class ScalertNotifier:
                 self._send(subject, plain, html, attachments,
                            recipients_override=recipients)
                 _cooldown_record(self._cfg, event_id, rname)
+                _pending_clear(self._cfg, event_id)
                 sent_any = True
             except Exception as e:
                 _log(f"region '{rname}': send failed: {e}")
@@ -1074,7 +1233,7 @@ class ScalertNotifier:
     # -----------------------------------------------------------------------
     # Subject
     # -----------------------------------------------------------------------
-    def _build_subject(self, ed) -> str:
+    def _build_subject(self, ed, is_update=False) -> str:
         mag_val = ed["mag_val"]
         depth   = ed["depth"]
 
@@ -1089,6 +1248,7 @@ class ScalertNotifier:
         else:
             urgency = ""
 
+        update_tag = "🔄 UPDATE: " if is_update else ""
         mag_str   = f"M{mag_val:.1f} {ed['mag_type']}".strip() if mag_val is not None else "M?"
         depth_str = f"[{depth:.0f}km]" if depth is not None else ""
 
@@ -1099,7 +1259,7 @@ class ScalertNotifier:
         short_id = ed["id"].split("/")[-1] if "/" in ed["id"] else ed["id"]
         short_id = short_id[:20]
 
-        parts = [urgency, f"🚨 {mag_str}", depth_str]
+        parts = [urgency, f"{update_tag}🚨 {mag_str}", depth_str]
         if time_str:
             parts.append(f"@ {time_str}")
         parts += [f"- {region}", f"[{short_id}]"]
