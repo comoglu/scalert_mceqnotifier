@@ -672,10 +672,8 @@ class ScalertNotifier:
             _log(f"skipping {event_id} M{magnitude:.1f} > max threshold {max_mag_str}")
             return 0
 
-        min_arr = self._cfg.getint("filter", "min_arrivals")
-        if min_arr > 0 and n_arrivals < min_arr:
-            _log(f"skipping {event_id} arrivals={n_arrivals} < threshold {min_arr}")
-            return 0
+        # NOTE: arrivals pre-filter moved to after XML fetch — scalert may
+        # pass n_arrivals=0 at trigger time; the XML has the real count.
 
         # ── Fetch event ──────────────────────────────────────────────────
         ep, xml_bytes = self._fetch_event(event_id)
@@ -690,6 +688,19 @@ class ScalertNotifier:
             _log(f"parse error: {e}")
             _log(traceback.format_exc())
             return 1
+
+        # Use the authoritative arrival count from the XML if the CLI
+        # value is missing or lower (scalert may pass 0 at trigger time)
+        xml_arrivals = ed.get("phases", 0) or 0
+        if xml_arrivals > n_arrivals:
+            _log(f"overriding CLI arrivals={n_arrivals} with XML "
+                 f"arrivalCount={xml_arrivals}")
+            n_arrivals = xml_arrivals
+
+        min_arr = self._cfg.getint("filter", "min_arrivals")
+        if min_arr > 0 and n_arrivals < min_arr:
+            _log(f"skipping {event_id} arrivals={n_arrivals} < threshold {min_arr}")
+            return 0
 
         # ── Handle "not existing" / false events ────────────────────────
         if ed["event_type"] == "not existing":
