@@ -26,6 +26,7 @@ CONFIG FILE: scalert_mceqnotifier.cfg (same directory as this script)
 from __future__ import absolute_import, division, print_function
 
 import configparser
+from datetime import datetime
 import glob as _glob_mod
 import json
 import math
@@ -110,6 +111,7 @@ _DEFAULTS = {
     },
     "logging": {
         "level": "info",          # debug | info | warning | error
+        "log_dir": "",            # directory for per-event log files (empty = disabled)
     },
 }
 
@@ -361,6 +363,7 @@ def _urgency(mag_val, tsunami_level=None):
 
 _LOG_LEVELS = {"debug": 0, "info": 1, "warning": 2, "error": 3}
 _log_level = 1  # default: info
+_log_file = None  # file handle for per-event log
 
 
 def _init_log_level(cfg):
@@ -369,9 +372,44 @@ def _init_log_level(cfg):
     _log_level = _LOG_LEVELS.get(level_str, 1)
 
 
+def _init_log_file(cfg, event_id):
+    """Open a per-event log file in the configured log_dir."""
+    global _log_file
+    log_dir = cfg.get("logging", "log_dir", fallback="").strip()
+    if not log_dir:
+        return
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    log_path = os.path.join(log_dir, f"mceqnotifier_{event_id}_{ts}.log")
+    try:
+        _log_file = open(log_path, "a")
+        _log(f"logging to {log_path}")
+    except OSError as e:
+        print(f"[scalert_mceqnotifier] [ERROR] cannot open log file {log_path}: {e}",
+              file=sys.stderr)
+
+
+def _close_log_file():
+    global _log_file
+    if _log_file:
+        try:
+            _log_file.close()
+        except OSError:
+            pass
+        _log_file = None
+
+
 def _log(msg, level="info"):
     if _LOG_LEVELS.get(level, 1) >= _log_level:
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] [{level.upper()}] {msg}"
         print(f"[scalert_mceqnotifier] [{level.upper()}] {msg}", file=sys.stderr)
+        if _log_file:
+            try:
+                _log_file.write(line + "\n")
+                _log_file.flush()
+            except OSError:
+                pass
 
 
 def _run_sc_tool(cmd, input_data=None, output_suffix=None, timeout=30):
@@ -597,6 +635,17 @@ class ScalertNotifier:
         n_arrivals = int(argv[4]) if argv[4].strip() else 0
         magnitude  = float(argv[5]) if len(argv) > 5 and argv[5].strip() else None
 
+        _init_log_file(self._cfg, event_id)
+
+        try:
+            return self._run_inner(
+                message, is_new, event_id, n_arrivals, magnitude)
+        finally:
+            _close_log_file()
+
+    # -----------------------------------------------------------------------
+    def _run_inner(self, message, is_new, event_id, n_arrivals, magnitude):
+        """Core logic, wrapped by run() for guaranteed log-file cleanup."""
         _log(f"triggered — event={event_id}  is_new={is_new}  "
              f"mag={magnitude}  arrivals={n_arrivals}")
 
