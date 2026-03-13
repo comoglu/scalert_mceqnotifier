@@ -57,6 +57,9 @@ bulletin_enhanced = true
 # KML event-location file attachment
 attach_kml = true
 
+# SeisComP XML attachment (preferred origin with picks, magnitudes, arrivals)
+attach_xml = false
+
 # Include Google Maps link in plain-text body
 include_maps_link = true
 

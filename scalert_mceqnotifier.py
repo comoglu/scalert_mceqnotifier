@@ -83,6 +83,7 @@ _DEFAULTS = {
         "bulletin_format":        "autoloc3",
         "bulletin_enhanced":      "true",
         "attach_kml":             "true",
+        "attach_xml":             "false",
         "include_maps_link":      "true",
         "footer":                 "Automated Earthquake Notification",
         "generate_travel_curves": "true",
@@ -670,7 +671,7 @@ class ScalertNotifier:
             return 0
 
         # ── Fetch event ──────────────────────────────────────────────────
-        ep = self._fetch_event(event_id)
+        ep, xml_bytes = self._fetch_event(event_id)
         if not ep:
             _log(f"could not fetch event {event_id}")
             return 1
@@ -696,7 +697,7 @@ class ScalertNotifier:
         subject  = self._build_subject(ed)
         bd       = self._prepare_body_data(ed)
         bulletin = self._get_bulletin_text(ep)
-        map_att  = self._gen_map(ed)
+        map_att  = self._gen_map(ed, xml_bytes)
         plain    = self._build_plain(ed, bd, bulletin)
         html     = self._build_html(ed, bd, bulletin, map_att)
 
@@ -704,6 +705,7 @@ class ScalertNotifier:
             ("generate_travel_curves", self._gen_travel_curves, (ed,)),
             ("generate_waveforms",     self._gen_waveforms,     (ed,)),
             ("attach_kml",             self._gen_kml,           (ep,)),
+            ("attach_xml",             self._gen_xml_attachment, (ed, xml_bytes)),
         ]
         attachments = [map_att] if map_att else []
         for key, fn, args in generators:
@@ -911,7 +913,10 @@ class ScalertNotifier:
     # Event fetching
     # -----------------------------------------------------------------------
     def _fetch_event(self, event_id):
-        """Dump event XML via scxmldump and parse into EventParameters."""
+        """Dump event XML via scxmldump and parse into EventParameters.
+
+        Returns (EventParameters, raw_xml_bytes) or (None, None).
+        """
         db  = self._cfg.get("seiscomp", "database").strip()
         cmd = ["scxmldump", "-E", event_id, "-p", "-P", "-M", "-A", "-o", "{OUT}"]
         if db:
@@ -919,7 +924,7 @@ class ScalertNotifier:
 
         xml_bytes, err = _run_sc_tool(cmd, output_suffix=".xml")
         if xml_bytes is None:
-            return None
+            return None, None
 
         try:
             tmp = tempfile.mktemp(suffix=".xml", prefix="scalert_mceq_parse_")
@@ -930,25 +935,25 @@ class ScalertNotifier:
             ar = io.XMLArchive()
             if not ar.open(tmp):
                 _log("cannot open XML archive")
-                return None
+                return None, None
             obj = ar.readObject()
             ar.close()
 
             if not obj:
                 _log("no object in XML")
-                return None
+                return None, None
 
             ep = datamodel.EventParameters.Cast(obj)
             if not ep:
                 _log("object is not EventParameters")
-                return None
+                return None, None
 
             _log(f"fetched {event_id}: {ep.eventCount()} event(s)")
-            return ep
+            return ep, xml_bytes
         except Exception as e:
             _log(f"fetch error: {e}")
             _log(traceback.format_exc())
-            return None
+            return None, None
         finally:
             if os.path.isfile(tmp):
                 os.remove(tmp)
@@ -1330,7 +1335,7 @@ class ScalertNotifier:
         else:                r = r_min
         return max(r_min, min(r_max, r))
 
-    def _gen_map(self, ed):
+    def _gen_map(self, ed, xml_bytes=None):
         lat     = ed["lat"]
         lon     = ed["lon"]
         mag_val = ed["mag_val"]
@@ -1339,22 +1344,39 @@ class ScalertNotifier:
         width   = self._cfg.get("map", "width")
         height  = self._cfg.get("map", "height")
 
-        cmd = [
-            "scmapcut", "-o", "{OUT}", "-d", f"{width}x{height}",
-            "--lat", str(lat), "--lon", str(lon), "--depth", str(depth),
-            "-m", f"{radius / 2:.2f}",
-        ]
-        if mag_val is not None:
-            cmd += ["--mag", f"{mag_val:.1f}"]
+        # Write event XML to temp file so scmapcut can plot stations
+        ep_tmp = None
+        if xml_bytes:
+            ep_tmp = tempfile.mktemp(suffix=".xml", prefix="scalert_mceq_ep_")
+            try:
+                with open(ep_tmp, "wb") as f:
+                    f.write(xml_bytes)
+            except OSError as e:
+                _log(f"cannot write temp XML for scmapcut: {e}", "warning")
+                ep_tmp = None
 
-        data, err = _run_sc_tool(cmd, output_suffix=".jpg", timeout=20)
-        if data is None:
-            return None
+        try:
+            cmd = [
+                "scmapcut", "-o", "{OUT}", "-d", f"{width}x{height}",
+                "--lat", str(lat), "--lon", str(lon), "--depth", str(depth),
+                "-m", f"{radius / 2:.2f}",
+            ]
+            if mag_val is not None:
+                cmd += ["--mag", f"{mag_val:.1f}"]
+            if ep_tmp:
+                cmd += ["--ep", ep_tmp]
 
-        import random, time
-        cid = f"{random.randint(0, 99999)}.{os.getpid()}.{time.time()}@gds.local"
-        _log(f"map generated ({len(data)} B)")
-        return ("epicenter.jpg", data, "image/jpeg", cid)
+            data, err = _run_sc_tool(cmd, output_suffix=".jpg", timeout=20)
+            if data is None:
+                return None
+
+            import random, time
+            cid = f"{random.randint(0, 99999)}.{os.getpid()}.{time.time()}@gds.local"
+            _log(f"map generated ({len(data)} B)")
+            return ("epicenter.jpg", data, "image/jpeg", cid)
+        finally:
+            if ep_tmp and os.path.isfile(ep_tmp):
+                os.remove(ep_tmp)
 
     # -----------------------------------------------------------------------
     # Travel-time curves — returns (name, bytes, mime_type, None) or None
@@ -1559,6 +1581,17 @@ class ScalertNotifier:
         _log(f"KML generated ({len(data)} B)")
         return ("event_location.kml", data,
                 "application/vnd.google-earth.kml+xml", None)
+
+    # -----------------------------------------------------------------------
+    # SeisComP XML attachment — preferred origin (from scxmldump -p -P -M -A)
+    # -----------------------------------------------------------------------
+    def _gen_xml_attachment(self, ed, xml_bytes):
+        if not xml_bytes:
+            return None
+        event_id = ed["id"]
+        fname = f"{event_id}.xml"
+        _log(f"XML attachment generated ({len(xml_bytes)} B)")
+        return (fname, xml_bytes, "application/xml", None)
 
     # -----------------------------------------------------------------------
     # SMTP sending
